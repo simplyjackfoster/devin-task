@@ -41,32 +41,77 @@ prompts, add `Bash(devin-task:*)` to your allow list.
 ## Usage
 
 ```
-devin-task [--edit | --yolo] [--model M] [--timeout SECS] "prompt"
-printf '%s' "$LONG_PROMPT" | devin-task [flags]
+devin-task [flags] "prompt"
+devin-task [flags] --prompt-file FILE
+printf '%s' "$PROMPT" | devin-task [flags]
 ```
 
-| Flag | Devin mode | What Devin may do |
-|---|---|---|
-| (none) | `auto` | read files; run `sed`, `grep`, `wc`, `ls`, `cat` style commands |
-| `--edit` | `accept-edits` | also write files in the workspace |
-| `--yolo` | `dangerous` | also run any command (`python3`, tests, tools) |
+| Flag | Effect |
+|---|---|
+| (none) | read-only: file tools plus a read-only shell allowlist (below) |
+| `--edit` | also write files in the workspace; still no commands beyond the allowlist |
+| `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote |
+| `--allow 'Exec(prefix)'` | add a Devin permission rule, repeatable, e.g. `'Exec(python3 -c)'` |
+| `--model M` | default `swe-1-7-medium`; `swe-1-7` and `glm-5-2` are also free at time of writing |
+| `--cwd DIR` | run there instead of `cd DIR &&` (which trips Claude Code's cwd-reset warning) |
+| `--timeout S` | per-pass wall clock, default 600; exit 124 and the process tree is killed |
+| `--preamble T` | prepend standing instructions; also `DEVIN_TASK_PREAMBLE` |
+| `--inherit-env` | prepend the caller's `python3`, `node` and `CONDA_PREFIX` so Devin uses them |
+| `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
+| `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
+| `--answer-only` | print only Devin's final message |
+| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}` |
+| `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
-- `--model` defaults to `swe-1-7-medium`. `swe-1-7` and `glm-5-2` are also
-  free at time of writing; `devin models list` shows current prices.
-- `--timeout` defaults to 600s. On timeout the wrapper kills Devin and exits 124.
-- Exit 3 means Devin refused an action in the current mode and stopped. The
-  message names the flag to use next.
+Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted, 124 timeout.
 
-Pick the mode up front. Devin stops at the first refused action and prints
-nothing, and it will almost always try to run a script it just wrote, so
-"write X.py" tasks belong in `--yolo` from the start. There is no working
-sandbox in print mode, so state in the prompt what Devin may and may not touch.
+### Read-only shell allowlist
+
+Devin's own read-only mode approves shell commands heuristically, and in
+practice a plain `head` or `sed -n` sometimes gets refused, which kills the
+run. The wrapper generates a config for each run that merges your
+`~/.config/devin/config.json` with explicit `Exec(...)` allow rules for:
+
+```
+cat head tail "sed -n" grep rg wc ls stat file diff jq cut tr uniq pwd which
+git log / git status / git diff / git show
+```
+
+Verified: pipes between these pass, `>` redirection and `sed -i` are still
+refused. Anything that can write on its own (`python3`, `awk`, `find`,
+`sort -o`, `tee`) is deliberately absent; add it with `--allow` when a task
+needs it. Needs `python3` on the caller's PATH to build the config; without
+it the wrapper warns and runs with Devin's defaults.
+
+### Resumable tasks with `--until`
+
+```bash
+devin-task --yolo --cwd ~/proj --until 'python3 check_labels.py chunk_07' --max-passes 12 \
+  --prompt-file /tmp/label_chunk_07.md
+```
+
+Each failing check resumes the same Devin session (by id, so concurrent runs
+in one directory do not collide) with the check's exit code and last 40 lines
+of output. Write checks that print what is missing. Run loops in the
+background from Claude Code: the Bash tool caps a call at 600s.
+
+### Environment mismatch
+
+Devin runs commands in a login shell, which can order PATH differently from
+your caller. On this machine Homebrew's python3 (no duckdb) comes before
+miniconda's. `--inherit-env` puts the caller's interpreter paths at the top
+of the prompt; `--preamble` does the same for anything else.
 
 ### From Claude Code's Bash tool
 
 Pass `timeout: 600000` (the tool's default 120s will kill most real tasks) or
-run with `run_in_background: true`. The wrapper forwards SIGTERM to Devin, so
-a killed call leaves no stray process.
+run with `run_in_background: true`. The wrapper forwards SIGTERM and kills
+Devin's whole process tree, so a killed call leaves nothing behind.
+
+### Concurrency
+
+Three concurrent runs in one directory worked with no interference. No rate
+limit was observed on the free models and none is documented.
 
 ## Why a wrapper at all
 
@@ -84,7 +129,11 @@ Verified against Devin CLI 3000.6.14 on macOS:
   `--sandbox` forces an "autonomous" mode that also refuses headless. Neither
   gives a safer middle ground between edit and yolo.
 - Devin's stdout concatenates progress messages without newlines; the final
-  answer is at the end.
+  answer is at the end. `--answer-only` and `--json` read it from the
+  conversation export instead.
+- The export is written only when the run ends and Devin's log files carry no
+  tool calls, so `--trace` cannot stream tool calls live. Live streaming would
+  need a JSON-RPC client for `devin acp`; that is the planned follow-up.
 
 ## Tests
 
@@ -92,9 +141,10 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Nineteen checks against a stub `devin` on PATH (argv, prompt delivery,
-refusal detection, timeout, signal propagation) plus one live round-trip on
-the free model.
+Forty-nine checks against a stub `devin` on PATH (argv, generated config and
+allowlist, prompt delivery, preamble, output modes, refusal detection,
+timeout, signal propagation, the `--until` loop) plus two live calls on the
+free model.
 
 ## Layout
 

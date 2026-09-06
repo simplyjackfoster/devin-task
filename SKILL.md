@@ -1,73 +1,93 @@
 ---
 name: devin
-description: Delegate a self-contained task to the local Devin CLI on the free SWE-1.7 model via the `devin-task` wrapper. Use to offload research, second opinions, mechanical multi-file edits, or side tasks that can run in parallel without spending Claude tokens. Also use when the user says "ask devin", "hand this to devin", or "use swe".
+description: Delegate a self-contained task to the local Devin CLI on the free SWE-1.7 model via the `devin-task` wrapper. Use to offload research, second opinions, mechanical multi-file edits, labeling/batch jobs, or side tasks that can run in parallel without spending Claude tokens. Also use when the user says "ask devin", "hand this to devin", or "use swe".
 ---
 
 # Devin CLI delegation
 
-`devin-task` runs one non-interactive Devin turn in the current directory on
-`swe-1-7-medium` (free, 262K context) and prints Devin's final answer to stdout.
-It is a symlink in `~/.local/bin` to `scripts/devin-task` in this skill.
+`devin-task` runs one non-interactive Devin turn on `swe-1-7-medium` (free,
+262K context) and prints Devin's output. It is a symlink in `~/.local/bin` to
+`scripts/devin-task` in this skill.
 
 ```bash
-devin-task "prompt"                       # read-only: Devin can read files, run read-only commands
-devin-task --edit "prompt"                # may also edit files in the workspace
-devin-task --yolo "prompt"                # auto-approves everything, incl. shell commands
-devin-task --model swe-1-7 "prompt"       # SWE-1.7 Max, also free; glm-5-2 is free too
-devin-task --timeout 300 "prompt"         # default 600s, exits 124 on timeout
-printf '%s' "$LONG_PROMPT" | devin-task   # long prompts via stdin
+devin-task "prompt"                                   # read-only
+devin-task --edit "prompt"                            # may write files
+devin-task --yolo "prompt"                            # may also run any command
+devin-task --cwd ~/proj --prompt-file /tmp/p.md       # no cd &&, no shell quoting
+devin-task --answer-only "prompt"                     # only Devin's final message
+devin-task --json "prompt"                            # {answer, session_id, exit_code, passes, tool_calls}
+devin-task --yolo --until 'python3 check.py' --max-passes 12 "prompt"   # loop until check exits 0
+devin-task --inherit-env --yolo "prompt"              # tell Devin which python3/node to use
+devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
 ```
 
-When calling from the Bash tool, pass `timeout: 600000` (the tool default of
-120s will kill most real tasks) or use `run_in_background: true`. The wrapper
-forwards SIGTERM to Devin, so a killed call does not leave a stray process.
-
-## When to use
-
-- Research or summarising a codebase area you don't want to read yourself.
-- A second opinion on a diff, plan, or bug hypothesis (independent model family).
-- Mechanical, well-specified edits across many files (`--edit`).
-- Side tasks that can run in the background while you keep working
-  (`run_in_background: true`).
-
-Do not use it for anything that needs the conversation's context Devin can't
-see, or where a wrong answer is expensive to detect. You own the result: read
-Devin's output critically and verify edits with `git diff`.
-
-## Writing the prompt
-
-Devin starts cold. Put everything it needs in the prompt: goal, relevant paths,
-constraints, and the exact output shape you want (e.g. "answer as a markdown
-list of file:line findings"). Multi-line prompts are fine; the wrapper passes
-them through a file, so quotes and backticks are safe.
+From the Bash tool pass `timeout: 600000` or use `run_in_background: true`;
+the tool's default 120s kills most real tasks. `--until` loops must run in the
+background (600s cap × passes). The wrapper forwards SIGTERM and kills Devin's
+whole process tree, so a killed call leaves nothing behind.
 
 ## Choosing the mode up front
 
-Devin stops at the first refused action and reports nothing, so pick the mode
-the task will actually need instead of escalating after a failure:
+Devin stops at the first refused action and prints nothing, so pick the mode
+the task will need. The wrapper exits 3 with a mode-specific hint on refusal,
+and partial edits may already be on disk.
 
-- Read-only (default) permits `sed`, `grep`, `wc`, `ls`, `cat` style reads but
-  refuses interpreters (`python3 -c` is rejected). Fine for critique, research,
-  and summaries.
-- `--edit` writes files but still cannot run commands. Devin will almost always
-  try to run a script it just wrote, so "write X.py" tasks belong in `--yolo`.
-- `--yolo` for anything that runs code, tests, or tools. Say what it may and
-  may not touch in the prompt; Devin's own `--sandbox` flag does not work in
-  print mode on this account, so the prompt is the only guardrail.
+| Mode | Devin may |
+|---|---|
+| default | use file tools, and run the read-only shell allowlist: `cat head tail sed -n grep rg wc ls stat file diff jq cut tr uniq pwd which git log/status/diff/show` (pipes allowed; `>` redirection and `sed -i` are refused) |
+| `--edit` | also write files. Still no commands beyond the allowlist. |
+| `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote. |
+
+`--allow 'Exec(<prefix>)'` (repeatable) extends the allowlist in any mode,
+e.g. `--allow 'Exec(python3 -c)'` or `--allow 'Exec(pytest)'`. Devin's own
+smart mode and `--sandbox` do not work headless on this account, so in
+`--yolo` the prompt is the only guardrail: say what Devin may and may not touch.
+
+## Environment mismatch
+
+Devin's shell is a login shell and may order PATH differently from the caller
+(here: Homebrew python3 without duckdb comes before miniconda's). For anything
+that imports packages, pass `--inherit-env` (adds the caller's `python3`,
+`node` and `CONDA_PREFIX` to the prompt) or write the interpreter path into
+the prompt yourself. `DEVIN_TASK_PREAMBLE` / `--preamble` prepend arbitrary
+standing instructions.
+
+## Writing the prompt
+
+Devin starts cold. Put everything it needs in the prompt: goal, relevant
+paths, constraints, the exact output shape. Long prompts: write them to a file
+and use `--prompt-file`; the wrapper never passes prompts through the shell.
+Devin's plain stdout concatenates its progress messages without newlines, so
+for anything parsed use `--answer-only` or `--json`.
+
+## Resumable tasks with --until
+
+`--until CMD` runs `bash -c CMD` in the working directory after each pass.
+Exit 0 ends the loop; otherwise the next pass resumes the same Devin session
+with the check's exit code and last 40 lines of output, so Devin sees exactly
+what is still missing. `--max-passes` (default 5) exhausted gives exit 5.
+Write the check to print what is missing, not just fail.
+
+## Concurrency
+
+Three concurrent `devin-task` runs in one directory worked with no
+interference. No rate limit was observed; none is documented for the free
+models. Each run has its own session, temp prompt and export.
 
 ## Failure modes
 
-- Exit 3 with "Devin refused an action": the mode was too restrictive. The
-  message names the flag to use. Devin may have written files before stopping,
-  so check `git status` before re-running.
-- Devin's stdout concatenates its progress messages without newlines; the
-  final answer is at the end.
-- Exit 124: timed out. Narrow the task or raise `--timeout`.
-- Empty stdout with exit 0 should not happen; if it does, check stderr.
+- Exit 3: refused action. The message names the flag to use; check `git status`.
+- Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
+- Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
+- Empty stdout with exit 0 should not happen; check stderr.
+- `--trace` cannot stream Devin's tool calls live: print mode writes the
+  conversation export only at the end and Devin's logs carry no tool calls. The
+  heartbeat shows elapsed time and bytes of output so far; the tool-call list
+  follows after each pass. Live streaming would need a client for `devin acp`.
 
 ## Cost
 
-`swe-1-7-medium`, `swe-1-7` and `glm-5-2` are free on this account. Any
-`--model` outside those bills Devin credits; `devin models list` shows prices.
+`swe-1-7-medium`, `swe-1-7` and `glm-5-2` are free on this account. Any other
+`--model` bills Devin credits; `devin models list` shows prices.
 
-Tests: `bash tests/test_devin_task.sh` (uses a stub devin, plus one live call).
+Tests: `bash tests/test_devin_task.sh` (stub devin plus two live calls).
