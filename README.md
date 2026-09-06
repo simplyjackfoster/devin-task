@@ -62,18 +62,21 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
 | `--retries N` | retry connection/capacity/rate-limit failures (exit 6) only, default 1; sleeps `backoff × attempt` seconds between attempts |
 | `--backoff S` | retry backoff base in seconds, default 30; also `DEVIN_TASK_RETRY_BASE`, which the flag overrides |
+| `--max-concurrent N` | run at most N devin passes at once across every `devin-task` on the machine (default: unlimited). Waits for a free slot; see [Concurrency](#concurrency) |
+| `--slot-timeout S` | how long to wait for a slot, default 600; exit 6 on expiry, so `--retries` applies |
 | `--no-empty-retry` | don't nudge-resume an empty turn (below) once; detection still runs and still exits 9 |
 | `--answer-only` | print only Devin's final message |
 | `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is; `passes` counts only `--until` passes — a nudge pass (below) is never counted |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
-6 connection error, capacity or rate limit (retryable), 7 upstream internal error,
+6 connection error, capacity, rate limit or no free concurrency slot
+(retryable), 7 upstream internal error,
 8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout,
 143 the wrapper was killed by SIGTERM or SIGINT.
 
-`--retries`, `--backoff`, `--timeout` and `--max-passes` (and
-`DEVIN_TASK_RETRY_BASE`) are checked before the first pass; a non-integer value
+`--retries`, `--backoff`, `--timeout`, `--max-passes`, `--max-concurrent` and
+`--slot-timeout` (and `DEVIN_TASK_RETRY_BASE`) are checked before the first pass; a non-integer value
 is a usage error (exit 2). `--backoff` is validated after it overrides
 `DEVIN_TASK_RETRY_BASE`, so a bad env value with a good flag is fine.
 
@@ -178,8 +181,35 @@ Devin's whole process tree, so a killed call leaves nothing behind.
 
 ### Concurrency
 
-Three concurrent runs in one directory worked with no interference. No rate
-limit was observed on the free models and none is documented.
+Concurrent runs in one directory do not interfere: each has its own session,
+temp prompt and export, and `--until` resumes by session id. The limit is
+upstream, not local. On the free tier **five concurrent sessions is the
+observed safe ceiling**: eight concurrent sessions were throttled on about a
+third of passes, while five with `--backoff 60` ran clean for an hour.
+
+`--max-concurrent N` enforces that ceiling for you. It is a machine-wide limit,
+shared by every `devin-task` process, not a per-invocation one — start twenty
+runs with `--max-concurrent 5` and only five talk to Devin at a time:
+
+```bash
+devin-task --yolo --max-concurrent 5 --backoff 60 --retries 3 \
+  --until './check.sh' --prompt-file chunk.md
+```
+
+A slot is a directory under `${TMPDIR:-/tmp}/devin-task-slots`
+(`DEVIN_TASK_SLOT_DIR` overrides it) holding the owning wrapper's pid. `mkdir`
+is the atomic primitive — macOS has no `flock` — so `slot-1`..`slot-N` are
+claimed race-free. A slot is acquired before each Devin pass and released on
+every exit path, including a `--timeout` kill and SIGTERM/SIGINT. A slot whose
+pid is no longer alive (a `kill -9`, a reboot) is reclaimed as stale; the
+reclaim goes through `mv` first, so when two waiters spot the same dead pid
+only one can win and the loser cannot delete the winner's new slot.
+
+If no slot is free the wrapper polls every 2 seconds up to `--slot-timeout
+SECS` (default 600) and then exits **6** with a stderr line — the same
+retryable class as a rate limit, so `--retries` re-attempts the acquisition.
+Without `--max-concurrent` the slot directory is never touched. `--trace`
+prints one line when the wait starts and one when the slot is acquired.
 
 ## Why a wrapper at all
 
@@ -209,10 +239,13 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Eighty-two checks against a stub `devin` on PATH (argv, generated config and
+Ninety-five checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
-timeout, signal propagation, failure classification, `--retries`, integer
-validation of the numeric flags, the `--until` loop, empty-turn detection and
+timeout, signal propagation, failure classification, `--retries` and
+`--backoff`, integer validation of the numeric flags, the `--max-concurrent`
+slot limiter (non-overlap of two concurrent runs, stale-slot reclaim, slot
+timeout, and slot release after a `--timeout` kill and after SIGTERM), the
+`--until` loop, empty-turn detection and
 `--no-empty-retry`, including a cumulative-export case where a later `--until`
 pass adds only empty steps, a non-object export, and a capacity failure
 retried during the nudge) plus two live calls on the free model. Set

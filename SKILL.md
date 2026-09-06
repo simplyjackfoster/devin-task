@@ -21,6 +21,7 @@ devin-task --inherit-env --yolo "prompt"              # tell Devin which python3
 devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
 devin-task --retries 2 "prompt"                       # retry connection/capacity/rate-limit failures (exit 6)
 devin-task --retries 3 --backoff 60 "prompt"          # 60s x attempt between retries (default 30)
+devin-task --max-concurrent 5 "prompt"                # machine-wide cap on simultaneous devin passes
 devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
 ```
 
@@ -74,16 +75,27 @@ Write the check to print what is missing, not just fail.
 
 ## Concurrency
 
-Three concurrent `devin-task` runs in one directory worked with no
-interference. No rate limit was observed; none is documented for the free
-models. Each run has its own session, temp prompt and export.
+Concurrent runs in one directory do not interfere — each has its own session,
+temp prompt and export. The limit is upstream. On the free tier **five
+concurrent sessions is the observed safe ceiling**: eight were throttled on
+about a third of passes, five with `--backoff 60` ran clean for an hour.
+
+`--max-concurrent N` enforces it machine-wide (a lock directory under
+`${TMPDIR:-/tmp}/devin-task-slots`, `DEVIN_TASK_SLOT_DIR` to move it), so you
+can fire off twenty background runs and only N talk to Devin at once. A slot is
+taken before each pass and released on every exit path, including a `--timeout`
+kill and SIGTERM; a slot whose owner died is reclaimed. Waiting longer than
+`--slot-timeout SECS` (default 600) exits 6, which `--retries` re-attempts.
+For a batch job the settings that ran clean were
+`--max-concurrent 5 --backoff 60 --retries 3`.
 
 ## Failure modes
 
 - Exit 3: refused action. The message names the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
 - Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
-- Exit 6: upstream connection error, capacity or rate-limit error (retryable).
+- Exit 6: upstream connection error, capacity or rate-limit error, or no free
+  `--max-concurrent` slot within `--slot-timeout` (all retryable).
   Devin's own "Connection error, send a message to continue retrying" counts.
   The wrapper already retries these itself up to `--retries N` times
   (default 1), sleeping `backoff × attempt` seconds between attempts — the base
@@ -105,8 +117,8 @@ models. Each run has its own session, temp prompt and export.
 - Exit 143: the wrapper itself was killed by SIGTERM or SIGINT. It kills
   Devin's process tree on the way out, so nothing is left running.
 - Exit 2 also covers a non-integer `--retries`, `--backoff`, `--timeout`,
-  `--max-passes` or `DEVIN_TASK_RETRY_BASE`; these are checked before the first
-  pass.
+  `--max-passes`, `--max-concurrent`, `--slot-timeout` or
+  `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -119,4 +131,4 @@ models. Each run has its own session, temp prompt and export.
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (82 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (95 stub-devin checks plus two live calls).

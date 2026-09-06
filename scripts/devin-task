@@ -23,6 +23,13 @@
 #                        default 1; sleeps backoff*attempt seconds between attempts
 #   --backoff SECS       retry backoff base in seconds, default 30 (env:
 #                        DEVIN_TASK_RETRY_BASE; the flag wins over the env var)
+#   --max-concurrent N   run at most N devin passes at a time across every
+#                        devin-task on this machine (default: unlimited). Waits
+#                        for a free slot; five is the observed safe ceiling on
+#                        the free tier.
+#   --slot-timeout SECS  how long to wait for a slot, default 600; exit 6 when
+#                        it expires, so --retries applies. Slot lock directory:
+#                        DEVIN_TASK_SLOT_DIR (default $TMPDIR/devin-task-slots)
 #   --no-empty-retry     don't nudge-resume an empty turn once; still exit 9
 # Output:
 #   --answer-only        print only Devin's final message
@@ -40,7 +47,8 @@
 # retried under --retries like any other pass.
 #
 # Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted,
-#             6 capacity or rate limit (retryable), 7 upstream internal error,
+#             6 connection/capacity/rate limit or no free slot (retryable),
+#             7 upstream internal error,
 #             8 authentication failure, 9 empty turn persisted after nudge,
 #             124 timeout, 143 killed by SIGTERM/SIGINT.
 set -u
@@ -50,6 +58,8 @@ PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
 ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
 RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-30}"; BACKOFF=""; BACKOFF_SET=0
 NO_EMPTY_RETRY=0
+MAX_CONCURRENT=""; SLOT_TIMEOUT=600; SLOT=""
+SLOT_DIR="${DEVIN_TASK_SLOT_DIR:-${TMPDIR:-/tmp}/devin-task-slots}"
 NUDGE_PROMPT='Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer.'
 ALLOW_EXTRA=()
 HEARTBEAT="${DEVIN_TASK_HEARTBEAT:-30}"
@@ -68,7 +78,59 @@ kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL straggl
   local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
   kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
 }
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+# ---- concurrency slots -------------------------------------------------------
+# A slot is a directory $SLOT_DIR/slot-N holding a `pid` file. `mkdir` is the
+# atomic primitive (macOS has no flock); the pid tells a later waiter whether
+# the holder is still alive. Reclaiming a stale slot goes through `mv` so that
+# when two waiters both spot the same dead pid only one of them can win, and
+# the loser cannot delete the winner's freshly created slot. A slot directory
+# with no pid file yet is being acquired right now, not stale.
+release_slot() {  # idempotent; safe to call from a trap
+  [ -n "$SLOT" ] || return 0
+  rm -rf "$SLOT"; SLOT=""
+}
+claim_slot() {  # $1 slot dir; 0 if claimed
+  mkdir "$1" 2>/dev/null || return 1
+  echo $$ > "$1/pid"; SLOT="$1"; return 0
+}
+acquire_slot() {  # sets SLOT, or sets RC=6 and returns 1 on --slot-timeout
+  [ -n "$MAX_CONCURRENT" ] || return 0
+  mkdir -p "$SLOT_DIR" 2>/dev/null
+  local waited=0 i d owner stale announced=0
+  while :; do
+    i=1
+    while [ "$i" -le "$MAX_CONCURRENT" ]; do
+      d="$SLOT_DIR/slot-$i"
+      if claim_slot "$d"; then
+        [ $TRACE -eq 1 ] && echo "[devin-task] concurrency slot $i acquired after ${waited}s" >&2
+        return 0
+      fi
+      owner="$(cat "$d/pid" 2>/dev/null)"
+      if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+        stale="$d.stale.$$"
+        if mv "$d" "$stale" 2>/dev/null; then
+          rm -rf "$stale"
+          if claim_slot "$d"; then
+            [ $TRACE -eq 1 ] && echo "[devin-task] concurrency slot $i acquired after ${waited}s (reclaimed from dead pid $owner)" >&2
+            return 0
+          fi
+        fi
+      fi
+      i=$((i+1))
+    done
+    if [ "$waited" -ge "$SLOT_TIMEOUT" ]; then
+      echo "devin-task: no free concurrency slot after ${waited}s (--max-concurrent $MAX_CONCURRENT, --slot-timeout $SLOT_TIMEOUT, $SLOT_DIR); exit 6" >&2
+      RC=6; return 1
+    fi
+    if [ $TRACE -eq 1 ] && [ $announced -eq 0 ]; then
+      echo "[devin-task] all $MAX_CONCURRENT concurrency slots busy; waiting up to ${SLOT_TIMEOUT}s" >&2
+      announced=1
+    fi
+    sleep 2; waited=$((waited+2))
+  done
+}
+
+usage() { sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
 
 # ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
@@ -109,6 +171,8 @@ while [ $# -gt 0 ]; do
     --max-passes)  MAX_PASSES="$2"; shift 2 ;;
     --retries)     RETRIES="$2"; shift 2 ;;
     --backoff)     BACKOFF="$2"; BACKOFF_SET=1; shift 2 ;;
+    --max-concurrent) MAX_CONCURRENT="$2"; shift 2 ;;
+    --slot-timeout)   SLOT_TIMEOUT="$2"; shift 2 ;;
     --no-empty-retry) NO_EMPTY_RETRY=1; shift ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --answer-only) ANSWER_ONLY=1; shift ;;
@@ -130,6 +194,11 @@ case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout needs a positive integer (got '$T
 [ "$TIMEOUT" -ge 1 ] || die "--timeout needs a positive integer (got '$TIMEOUT')"
 case "$MAX_PASSES" in ''|*[!0-9]*) die "--max-passes needs a positive integer (got '$MAX_PASSES')" ;; esac
 [ "$MAX_PASSES" -ge 1 ] || die "--max-passes needs a positive integer (got '$MAX_PASSES')"
+if [ -n "$MAX_CONCURRENT" ]; then
+  case "$MAX_CONCURRENT" in ''|*[!0-9]*) die "--max-concurrent needs a positive integer (got '$MAX_CONCURRENT')" ;; esac
+  [ "$MAX_CONCURRENT" -ge 1 ] || die "--max-concurrent needs a positive integer (got '$MAX_CONCURRENT')"
+fi
+case "$SLOT_TIMEOUT" in ''|*[!0-9]*) die "--slot-timeout needs a non-negative integer (got '$SLOT_TIMEOUT')" ;; esac
 
 # ---- prompt: --prompt-file > positional > stdin ----
 if [ -n "$PROMPT_FILE" ]; then
@@ -158,7 +227,7 @@ if [ -n "$CWD" ]; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'release_slot; rm -rf "$WORK"' EXIT
 HAVE_PY=0; command -v python3 >/dev/null 2>&1 && HAVE_PY=1
 
 # ---- permission config: user config + read-only allowlist (+ --allow) ----
@@ -187,6 +256,7 @@ fi
 # ---- one devin pass; sets RC, honours timeout/heartbeat ----
 run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdout-file-or-empty
   local pf="$1" ex="$2" sid="$3" so="$4" args=()
+  acquire_slot || return   # RC=6 already set by acquire_slot
   [ -n "$CONFIG" ] && args+=(--config "$CONFIG")
   if [ -n "$sid" ]; then args+=(-r "$sid"); else args+=(--model "$MODEL"); fi
   args+=(--permission-mode "$PERM" --respect-workspace-trust false --prompt-file "$pf" --export "$ex" -p)
@@ -194,11 +264,11 @@ run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdou
   if [ -n "$so" ]; then devin "${args[@]}" >"$so" 2>"$WORK/stderr" &
   else                  devin "${args[@]}" > >(tee "$WORK/stdout") 2>"$WORK/stderr" & fi
   PID=$!
-  trap 'kill_tree "$PID"; rm -rf "$WORK"; exit 143' TERM INT
+  trap 'kill_tree "$PID"; release_slot; rm -rf "$WORK"; exit 143' TERM INT
   local waited=0
   while kill -0 "$PID" 2>/dev/null; do
     if [ "$waited" -ge "$TIMEOUT" ]; then
-      kill_tree "$PID"
+      kill_tree "$PID"; release_slot
       echo "devin-task: timed out after ${TIMEOUT}s" >&2
       RC=124; return
     fi
@@ -209,6 +279,7 @@ run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdou
     fi
   done
   wait "$PID"; RC=$?
+  release_slot
   [ -s "$WORK/stderr" ] && cat "$WORK/stderr" >&2
   if grep -q "rejected a tool call that requires confirmation" "$WORK/stderr"; then
     local hint

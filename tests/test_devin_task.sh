@@ -44,6 +44,16 @@ case "${STUB_MODE:-ok}" in
   internal)  echo "Error: internal error occurred (trace ID: abcd1234)" >&2; exit 1 ;;
   auth)      echo "Error: request unauthorized: invalid api key" >&2; exit 1 ;;
   ratelimit) echo "Error: too many requests, rate limit exceeded" >&2; exit 1 ;;
+  slow3)
+    # records wall-clock start/end so a concurrency test can assert two runs
+    # never overlapped. $$ keeps the two concurrent stubs apart; STUB_CALLS'
+    # line count would not (both can read the same value).
+    echo "$$ start $(date +%s)" >> "${STUB_TIMES:-/dev/null}"
+    sleep 3
+    echo "$$ end $(date +%s)" >> "${STUB_TIMES:-/dev/null}"
+    echo "narrative line"; echo "STUB-OK"
+    [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    ;;
   connection) echo "Connection error, send a message to continue retrying" >&2; exit 1 ;;
   connection_then_ok)
     if [ "$n" -lt 2 ]; then
@@ -123,8 +133,9 @@ STUB
 chmod +x "$TMP/bin/devin"
 printf '%s' '{"agent":{"model":"swe-1-7-medium"},"permissions":{"allow":["Fetch(domain:*)"]}}' > "$TMP/userconfig.json"
 export PATH="$TMP/bin:$PATH" STUB_ARGV="$TMP/argv" STUB_PROMPT="$TMP/prompt" STUB_CWD="$TMP/cwd" \
-       STUB_CONFIG="$TMP/config" STUB_CALLS="$TMP/calls" DEVIN_TASK_USER_CONFIG="$TMP/userconfig.json"
-reset() { rm -f "$STUB_ARGV"* "$STUB_PROMPT"* "$STUB_CONFIG" "$STUB_CALLS"; unset DEVIN_TASK_PREAMBLE; }
+       STUB_CONFIG="$TMP/config" STUB_CALLS="$TMP/calls" DEVIN_TASK_USER_CONFIG="$TMP/userconfig.json" \
+       DEVIN_TASK_SLOT_DIR="$TMP/slots"
+reset() { rm -f "$STUB_ARGV"* "$STUB_PROMPT"* "$STUB_CONFIG" "$STUB_CALLS"; rm -rf "$TMP/slots"; unset DEVIN_TASK_PREAMBLE; }
 argv_pair() { paste -sd' ' "$STUB_ARGV" | grep -qF -- "$1"; }
 has_arg()   { grep -qxF -- "$1" "$STUB_ARGV"; }
 allow_has() { python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1]))["permissions"]["allow"] else 1)' "$STUB_CONFIG" "$1"; }
@@ -179,7 +190,7 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
 out="$("$WRAPPER" --help 2>&1)"; rc=$?
-[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--max-concurrent" && echo "$out" | grep -q -- "--slot-timeout" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --max-concurrent, --slot-timeout, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
@@ -259,6 +270,56 @@ reset; out="$("$WRAPPER" --timeout 0 "x" 2>&1)"; rc=$?
 [ $rc -eq 2 ] && ok "--timeout 0 -> exit 2 (a pass needs at least a second)" || fail "--timeout 0" "rc=$rc out=$out"
 reset; out="$("$WRAPPER" --max-passes 0 "x" 2>&1)"; rc=$?
 [ $rc -eq 2 ] && echo "$out" | grep -q -- "--max-passes" && ok "--max-passes 0 -> exit 2" || fail "--max-passes validation" "rc=$rc out=$out"
+
+echo "--max-concurrent"
+reset; "$WRAPPER" "x" >/dev/null 2>&1
+[ ! -d "$TMP/slots" ] && ok "without --max-concurrent no slot directory is touched" || fail "slot dir created unasked"
+reset; out="$("$WRAPPER" --max-concurrent 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--max-concurrent" && ok "--max-concurrent 0 -> exit 2" || fail "--max-concurrent validation" "rc=$rc $out"
+reset; out="$("$WRAPPER" --slot-timeout abc "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--slot-timeout" && ok "--slot-timeout abc -> exit 2" || fail "--slot-timeout validation" "rc=$rc $out"
+reset; out="$("$WRAPPER" --max-concurrent 2 "x" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ ! -d "$TMP/slots/slot-1" ] && ok "a finished pass releases its slot" || fail "slot not released" "rc=$rc $(ls "$TMP/slots" 2>&1)"
+
+# two wrappers, one slot: the second must not start until the first has ended.
+# Timing-based (the stub holds its slot for 3s, the waiter polls every 2s).
+reset; rm -f "$TMP/times"
+STUB_TIMES="$TMP/times" STUB_MODE=slow3 "$WRAPPER" --max-concurrent 1 "a" >/dev/null 2>&1 &
+c1=$!; sleep 1
+STUB_TIMES="$TMP/times" STUB_MODE=slow3 "$WRAPPER" --max-concurrent 1 "b" >/dev/null 2>&1 &
+c2=$!; wait $c1; r1=$?; wait $c2; r2=$?
+starts=$(grep -c ' start ' "$TMP/times" 2>/dev/null || echo 0)
+ends=$(grep -c ' end ' "$TMP/times" 2>/dev/null || echo 0)
+[ $r1 -eq 0 ] && [ $r2 -eq 0 ] && [ "$starts" = "2" ] && [ "$ends" = "2" ] && ok "--max-concurrent 1: both runs completed (2 starts, 2 ends)" || fail "concurrent runs" "r1=$r1 r2=$r2 $(cat "$TMP/times" 2>&1)"
+first_end=$(grep ' end ' "$TMP/times" | head -1 | awk '{print $3}')
+second_start=$(grep ' start ' "$TMP/times" | tail -1 | awk '{print $3}')
+[ -n "$first_end" ] && [ -n "$second_start" ] && [ "$second_start" -ge "$first_end" ] && ok "--max-concurrent 1: the second pass starts only after the first ends (no overlap)" || fail "passes overlapped" "first_end=$first_end second_start=$second_start $(cat "$TMP/times" 2>&1)"
+
+reset; mkdir -p "$TMP/slots/slot-1"; echo 999999 > "$TMP/slots/slot-1/pid"
+out="$("$WRAPPER" --max-concurrent 1 --slot-timeout 4 "x" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "a slot held by a dead pid is reclaimed" || fail "stale slot not reclaimed" "rc=$rc $out"
+
+# one live holder process for the three "slot is taken" cases below; it must
+# outlast all of them, or its slot is reclaimed as stale and nothing waits.
+reset; sleep 300 & holder=$!; disown 2>/dev/null || true
+hold_slot() { reset; mkdir -p "$TMP/slots/slot-1"; echo "$holder" > "$TMP/slots/slot-1/pid"; }
+hold_slot; out="$("$WRAPPER" --max-concurrent 1 --slot-timeout 2 --retries 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && echo "$out" | grep -qi "no free concurrency slot" && [ ! -f "$STUB_CALLS" ] && ok "--slot-timeout expiry -> exit 6 with no devin call" || fail "slot timeout" "rc=$rc $out"
+hold_slot; out="$("$WRAPPER" --max-concurrent 1 --slot-timeout 2 --backoff 0 --retries 1 "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && [ "$(echo "$out" | grep -c "no free concurrency slot")" = "2" ] && ok "a slot timeout is retried under --retries (2 attempts, exit 6)" || fail "slot timeout retried" "rc=$rc $out"
+hold_slot; out="$("$WRAPPER" --max-concurrent 1 --slot-timeout 2 --retries 0 --trace "x" 2>&1 >/dev/null)"
+echo "$out" | grep -q "slots busy; waiting" && ok "--trace announces that it is waiting for a slot" || fail "trace wait line" "$out"
+kill "$holder" 2>/dev/null
+reset; out="$(STUB_TIMES=/dev/null STUB_MODE=slow3 "$WRAPPER" --max-concurrent 1 --trace "x" 2>&1 >/dev/null)"
+echo "$out" | grep -q "concurrency slot 1 acquired" && ok "--trace names the slot when it is acquired" || fail "trace acquire line" "$out"
+
+reset; out="$(STUB_MODE=hang "$WRAPPER" --max-concurrent 1 --timeout 2 "x" 2>&1)"; rc=$?
+[ $rc -eq 124 ] && [ ! -d "$TMP/slots/slot-1" ] && ok "a --timeout kill releases the slot" || fail "slot leaked after timeout" "rc=$rc $(ls "$TMP/slots" 2>&1)"
+reset; STUB_MODE=hang "$WRAPPER" --max-concurrent 1 --timeout 30 "x" >/dev/null 2>&1 &
+wpid=$!; sleep 2; held=0; [ -d "$TMP/slots/slot-1" ] && held=1
+kill -TERM "$wpid"; sleep 2
+[ "$held" = "1" ] && [ ! -d "$TMP/slots/slot-1" ] && ok "SIGTERM to the wrapper releases the slot" || fail "slot leaked after SIGTERM" "held=$held $(ls "$TMP/slots" 2>&1)"
+pkill -f "$TMP/bin/devin" 2>/dev/null
 
 echo "--until loop"
 cat > "$TMP/check.sh" <<'CHK'
