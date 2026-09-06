@@ -40,10 +40,12 @@ case "${STUB_MODE:-ok}" in
     ;;
   reject) echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2; exit 0 ;;
   hang)   sleep 30; echo "never" ;;
+  hang_quiet) exec sleep 30 ;;   # exec: no shell left to print anything after the kill
   capacity)  echo "Error: the servers are currently overloaded, please try again later" >&2; exit 1 ;;
   internal)  echo "Error: internal error occurred (trace ID: abcd1234)" >&2; exit 1 ;;
   auth)      echo "Error: request unauthorized: invalid api key" >&2; exit 1 ;;
   ratelimit) echo "Error: too many requests, rate limit exceeded" >&2; exit 1 ;;
+  errorkind) echo "cognition.ai/errorKind: resource_exhausted" >&2; exit 1 ;;
   advance)
     # advances $STUB_COUNTER by $STUB_GAIN (default 1) on every call, or only
     # on the call numbers listed in $STUB_GAIN_CALLS, so a --progress test can
@@ -209,7 +211,7 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
 out="$("$WRAPPER" --help 2>&1)"; rc=$?
-[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--max-concurrent" && echo "$out" | grep -q -- "--slot-timeout" && echo "$out" | grep -q -- "--progress" && echo "$out" | grep -q -- "--max-stalls" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --max-concurrent, --slot-timeout, --progress, --max-stalls, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--max-concurrent" && echo "$out" | grep -q -- "--slot-timeout" && echo "$out" | grep -q -- "--progress" && echo "$out" | grep -q -- "--max-stalls" && echo "$out" | grep -q -- "--summary" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --max-concurrent, --slot-timeout, --progress, --max-stalls, --summary, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
@@ -249,6 +251,8 @@ reset; out="$(STUB_MODE=internal "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 7 ] && echo "$out" | grep -qi "internal" && ok "internal error text -> exit 7" || fail "internal classification" "rc=$rc $out"
 reset; out="$(STUB_MODE=auth "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 8 ] && echo "$out" | grep -qi "auth" && ok "auth text -> exit 8" || fail "auth classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=errorkind "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && ok "the literal 'cognition.ai/errorKind: resource_exhausted' -> exit 6" || fail "errorKind classification" "rc=$rc $out"
 reset; out="$(STUB_MODE=ratelimit "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 6 ] && echo "$out" | grep -qi "rate limit" && ok "rate limit text -> exit 6" || fail "ratelimit classification" "rc=$rc $out"
 reset; out="$(STUB_MODE=connection "$WRAPPER" "x" 2>&1)"; rc=$?
@@ -436,6 +440,69 @@ reset; out="$(STUB_MODE=list_export "$WRAPPER" --answer-only "do the task" 2>"$T
 echo "the nudge pass is retried like any other pass (--retries)"
 reset; out="$(STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --backoff 0 --retries 1 "do the task" 2>&1)"; rc=$?
 [ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "a capacity failure during the nudge is retried like the main pass (3 calls, exit 0)" || fail "nudge retried" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+
+echo "a timeout that produced no output at all"
+reset; out="$(STUB_MODE=hang_quiet "$WRAPPER" --timeout 2 "x" 2>"$TMP/err")"; rc=$?
+[ $rc -eq 124 ] && [ -z "$out" ] && ! grep -qi "traceback" "$TMP/err" \
+  && ok "a timeout with empty output exits 124, prints nothing on stdout, and does not traceback" \
+  || fail "empty-output timeout" "rc=$rc out=$out err=$(cat "$TMP/err")"
+reset; out="$(STUB_MODE=hang_quiet "$WRAPPER" --timeout 2 --json "x" 2>/dev/null)"; rc=$?
+[ $rc -eq 124 ] && printf '%s' "$out" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+sys.exit(0 if d["exit_code"] == 124 and d["answer"] == "" and d["tool_calls"] == [] else 1)' \
+  && ok "--json over an empty-output timeout is still valid JSON with exit_code 124" \
+  || fail "json after empty timeout" "rc=$rc out=$out"
+reset; out="$(STUB_MODE=hang_quiet "$WRAPPER" --timeout 2 --answer-only "x" 2>/dev/null)"; rc=$?
+[ $rc -eq 124 ] && [ -z "$out" ] && ok "--answer-only over an empty-output timeout prints nothing" \
+  || fail "answer-only after empty timeout" "rc=$rc out=$out"
+
+echo "three concurrent calls"
+reset; rm -f "$TMP/times3"
+for i in 1 2 3; do
+  STUB_TIMES="$TMP/times3" STUB_MODE=slow3 "$WRAPPER" --max-concurrent 3 "c$i" >/dev/null 2>&1 &
+done
+wait
+starts=$(grep -c " start " "$TMP/times3" 2>/dev/null || echo 0)
+ends=$(grep -c " end " "$TMP/times3" 2>/dev/null || echo 0)
+[ "$starts" = "3" ] && [ "$ends" = "3" ] && ok "--max-concurrent 3: three concurrent runs all complete" \
+  || fail "3 concurrent" "starts=$starts ends=$ends $(cat "$TMP/times3" 2>&1)"
+last_start=$(grep " start " "$TMP/times3" | awk '{print $3}' | sort -n | tail -1)
+first_end=$(grep " end " "$TMP/times3" | awk '{print $3}' | sort -n | head -1)
+[ -n "$last_start" ] && [ -n "$first_end" ] && [ "$last_start" -le "$first_end" ] \
+  && ok "--max-concurrent 3: all three overlap (the limit does not serialise them)" \
+  || fail "3 concurrent serialised" "last_start=$last_start first_end=$first_end"
+reset; rm -f "$TMP/times2of3"
+for i in 1 2 3; do
+  STUB_TIMES="$TMP/times2of3" STUB_MODE=slow3 "$WRAPPER" --max-concurrent 2 --slot-timeout 30 "c$i" >/dev/null 2>&1 &
+done
+wait
+starts=$(grep -c " start " "$TMP/times2of3" 2>/dev/null || echo 0)
+last_start=$(grep " start " "$TMP/times2of3" | awk '{print $3}' | sort -n | tail -1)
+first_end=$(grep " end " "$TMP/times2of3" | awk '{print $3}' | sort -n | head -1)
+[ "$starts" = "3" ] && [ "$last_start" -ge "$first_end" ] \
+  && ok "--max-concurrent 2 with three callers: the third waits for a slot to free" \
+  || fail "2-of-3 gating" "starts=$starts last_start=$last_start first_end=$first_end"
+
+echo "--summary"
+reset; err="$(STUB_MODE=ok "$WRAPPER" "x" 2>&1 >/dev/null)"
+! echo "$err" | grep -q "elapsed" && ok "no summary by default: existing callers see unchanged stderr" || fail "summary leaked by default" "$err"
+reset; err="$(STUB_MODE=ok "$WRAPPER" --summary "x" 2>&1 >/dev/null)"
+echo "$err" | grep -qE "devin-task: [0-9]+s elapsed, [0-9]+ tool calls, exit 0" \
+  && ok "--summary prints elapsed seconds and a tool-call count on stderr" || fail "summary ok" "$err"
+echo "$err" | grep -qE ", [1-9][0-9]* tool calls" \
+  && ok "the tool-call count is the export's real count, not zero" || fail "tool count" "$err"
+reset; err="$(DEVIN_TASK_SUMMARY=1 STUB_MODE=ok "$WRAPPER" "x" 2>&1 >/dev/null)"
+echo "$err" | grep -q "elapsed" && ok "DEVIN_TASK_SUMMARY=1 turns it on without the flag" || fail "summary env" "$err"
+reset; out="$(STUB_MODE=ok "$WRAPPER" --summary "x" 2>/dev/null)"
+[ "$out" = $'narrative line\nSTUB-OK' ] && ok "--summary leaves stdout untouched" || fail "summary on stdout" "$out"
+reset; err="$(STUB_MODE=hang_quiet "$WRAPPER" --summary --timeout 2 "x" 2>&1 >/dev/null)"
+echo "$err" | grep -qE "devin-task: [0-9]+s elapsed, [0-9]+ tool calls, exit 124" \
+  && ok "a timed-out run still reports its elapsed time and exit code" || fail "summary timeout" "$err"
+reset; err="$(STUB_MODE=capacity "$WRAPPER" --summary --retries 0 "x" 2>&1 >/dev/null)"
+echo "$err" | grep -qE "exit 6$" && ok "a classified failure's summary carries the classified exit code" || fail "summary rc6" "$err"
+err="$("$WRAPPER" --summary --timeout abc "x" 2>&1 >/dev/null)"
+! echo "$err" | grep -q "elapsed" && ok "a usage error prints no summary (nothing ran)" || fail "summary on usage error" "$err"
 
 if [ "${DEVIN_TASK_TEST_NO_LIVE:-0}" = "1" ]; then
   echo "live: skipped"

@@ -24,6 +24,7 @@ devin-task --retries 3 --backoff 60 "prompt"          # 60s x attempt between re
 devin-task --max-concurrent 5 "prompt"                # machine-wide cap on simultaneous devin passes
 devin-task --until 'CHK' --progress 'COUNT' "prompt"  # stop on stalled progress, not on a pass count
 devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
+devin-task --summary "prompt"                         # stderr: elapsed, tool-call count, exit code
 ```
 
 From the Bash tool pass `timeout: 600000` or use `run_in_background: true`;
@@ -148,6 +149,10 @@ For a batch job the settings that ran clean were
 - Exit 2 also covers a non-integer `--retries`, `--backoff`, `--timeout`,
   `--max-passes`, `--max-concurrent`, `--slot-timeout`, `--max-stalls` or
   `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
+- `--summary` (or `DEVIN_TASK_SUMMARY=1`) adds one stderr line at exit —
+  `devin-task: 137s elapsed, 24 tool calls, exit 0` — on every exit path once a
+  run has started. Off by default so existing callers' stderr is unchanged. Use
+  it to log per-pass cost from a loop without parsing `--json`.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -160,4 +165,4 @@ For a batch job the settings that ran clean were
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (107 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (122 stub-devin checks plus two live calls).

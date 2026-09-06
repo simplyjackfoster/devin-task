@@ -70,6 +70,7 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--answer-only` | print only Devin's final message |
 | `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is; `passes` counts only `--until` passes — a nudge pass (below) is never counted |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
+| `--summary` | one line on stderr at exit: `devin-task: 137s elapsed, 24 tool calls, exit 0`. Off unless the flag or `DEVIN_TASK_SUMMARY=1` is given, so existing callers' stderr is unchanged. For logging per-pass cost from a batch driver without parsing `--json` |
 
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted
 (`--max-passes`, or `--max-stalls` under `--progress`),
@@ -116,7 +117,8 @@ transient error is never misread as a dead login:
 4. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
    `unauthorized`, `invalid ... api key/token`, `authentication failed`
 5. **rate limit** (exit 6) — `rate limit`, `too many requests`,
-   `resource_exhausted`
+   `resource_exhausted` (Devin surfaces the last of these as
+   `cognition.ai/errorKind: resource_exhausted`)
 
 The existing refusal detection (a rejected tool call → exit 3) keeps
 precedence over all of these. Only exit-6 conditions (connection error,
@@ -305,14 +307,17 @@ bash tests/test_devin_task.sh
 bash tests/test_examples_batch.sh
 ```
 
-A hundred and seven checks against a stub `devin` on PATH (argv, generated config and
+A hundred and twenty-two checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries` and
 `--backoff`, integer validation of the numeric flags, the `--max-concurrent`
 slot limiter (non-overlap of two concurrent runs, stale-slot reclaim, slot
 timeout, and slot release after a `--timeout` kill and after SIGTERM), the
 `--until` loop, `--progress`/`--max-stalls` (an unbounded productive run, five
-zero-gain passes, a gain resetting the counter, and a non-integer reading), empty-turn detection and
+zero-gain passes, a gain resetting the counter, and a non-integer reading),
+a timeout that produced no output at all (plain, `--json` and `--answer-only`),
+three concurrent runs overlapping under `--max-concurrent 3` and the third
+being gated under `--max-concurrent 2`, `--summary` and its default silence, empty-turn detection and
 `--no-empty-retry`, including a cumulative-export case where a later `--until`
 pass adds only empty steps, a non-object export, and a capacity failure
 retried during the nudge) plus two live calls on the free model. Set

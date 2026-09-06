@@ -41,6 +41,10 @@
 #   --answer-only        print only Devin's final message
 #   --json               print {answer, session_id, exit_code, passes, tool_calls}
 #   --trace              heartbeat to stderr while running; tool-call list after
+#   --summary            one line on stderr at exit: elapsed seconds, tool-call
+#                        count, exit code (env: DEVIN_TASK_SUMMARY=1). Off by
+#                        default, because a new unconditional stderr line would
+#                        change what existing callers see.
 #
 # On a failed pass, Devin's stderr/stdout is classified (transient-first: connection
 # error, capacity, internal error, auth, rate limit); the refusal check above keeps
@@ -64,7 +68,8 @@ MODEL="swe-1-7-medium"; PERM="auto"; TIMEOUT=600; CWD=""
 PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
 ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
 RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-30}"; BACKOFF=""; BACKOFF_SET=0
-NO_EMPTY_RETRY=0
+NO_EMPTY_RETRY=0; SUMMARY=0
+[ "${DEVIN_TASK_SUMMARY:-0}" = "1" ] && SUMMARY=1
 MAX_CONCURRENT=""; SLOT_TIMEOUT=600; SLOT=""
 PROGRESS=""; MAX_STALLS=5; STALLS=0
 PROG_VALUE=0; PROG_NEW=""; PROG_RAW=""; PROG_RC=0; PROG_DELTA=0; PROG_NOTE=""
@@ -139,7 +144,7 @@ acquire_slot() {  # sets SLOT, or sets RC=6 and returns 1 on --slot-timeout
   done
 }
 
-usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
 
 # ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
@@ -185,6 +190,7 @@ while [ $# -gt 0 ]; do
     --max-concurrent) MAX_CONCURRENT="$2"; shift 2 ;;
     --slot-timeout)   SLOT_TIMEOUT="$2"; shift 2 ;;
     --no-empty-retry) NO_EMPTY_RETRY=1; shift ;;
+    --summary)     SUMMARY=1; shift ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --answer-only) ANSWER_ONLY=1; shift ;;
     --json)        JSON=1; shift ;;
@@ -240,7 +246,26 @@ if [ -n "$CWD" ]; then
 fi
 
 WORK="$(mktemp -d)"
-trap 'release_slot; rm -rf "$WORK"' EXIT
+START_TS="$(date +%s)"
+
+# ---- --summary: one line on stderr on every exit path once the run has started, so a batch
+# driver can log per-pass cost without asking for --json and parsing it. Opt-in: an
+# unconditional line would change what every existing caller sees on stderr. It runs before
+# $WORK is removed so the export is still there to count tool calls in; a SIGTERM path that
+# already cleared $WORK reports 0 tool calls but still reports elapsed time. Flag validation
+# exits before this trap is installed and so prints nothing; the --progress baseline check is
+# the one usage error that comes after it, and does report a summary with exit 2. ----
+exit_summary() {
+  local rc=$?
+  [ $SUMMARY -eq 1 ] || return $rc
+  local secs=$(( $(date +%s) - START_TS )) tools=0
+  if [ -n "${EXPORT:-}" ] && [ -s "${EXPORT:-/nonexistent}" ]; then
+    tools="$(export_field "$EXPORT" tools 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  echo "devin-task: ${secs}s elapsed, ${tools} tool calls, exit $rc" >&2
+  return $rc
+}
+trap 'exit_summary; release_slot; rm -rf "$WORK"' EXIT
 HAVE_PY=0; command -v python3 >/dev/null 2>&1 && HAVE_PY=1
 
 # ---- permission config: user config + read-only allowlist (+ --allow) ----
