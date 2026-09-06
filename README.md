@@ -192,8 +192,10 @@ For any task producing many rows or files, tell Devin in the prompt to append
 its output every 20 rows or so and to write append-only, never rewriting the
 file — a pass that hits the 600-second timeout otherwise leaves nothing behind.
 The rule and an example prompt fragment are in
-[SKILL.md](SKILL.md#writing-the-prompt), and `examples/batch/` is a loop built
-on it.
+[SKILL.md](SKILL.md#writing-the-prompt), and
+[`examples/batch/`](examples/batch/) is a complete loop built on it —
+`check.sh` for `--until` and `--progress`, `run.sh` for the chunked prompt,
+`dedupe.sh` for the duplicates a retry leaves behind.
 
 ### Progress-based stopping: `--progress` and `--max-stalls`
 
@@ -300,6 +302,7 @@ Verified against Devin CLI 3000.6.14 on macOS:
 
 ```bash
 bash tests/test_devin_task.sh
+bash tests/test_examples_batch.sh
 ```
 
 A hundred and six checks against a stub `devin` on PATH (argv, generated config and
@@ -317,6 +320,12 @@ retried during the nudge) plus two live calls on the free model. Set
 instead). CI runs this suite with that var set, and the ACP suite, which makes
 no live calls, as it is, on every push and pull request.
 
+`tests/test_examples_batch.sh` adds sixteen checks that drive
+`examples/batch/run.sh` through the wrapper against a stub `devin` which
+appends a few of the still-missing rows per call and re-appends one every
+other call, then asserts every id landed and `dedupe.sh` collapses the
+duplicates. No live calls; CI runs it too.
+
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file
 in place can make a running wrapper resume parsing mid-file when its wait
@@ -327,7 +336,8 @@ loop ends.
 ```
 SKILL.md              Claude Code skill: when and how Claude should delegate
 scripts/devin-task    the wrapper (bash, no dependencies beyond devin)
-tests/                stub-based test suite
+examples/batch/       a worked chunked-batch loop: check.sh, run.sh, dedupe.sh
+tests/                stub-based test suites
 install.sh            symlinks into ~/.claude/skills and ~/.local/bin
 ```
 

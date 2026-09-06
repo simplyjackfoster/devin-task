@@ -78,7 +78,9 @@ collapses. Two lines in the prompt do it:
 > Append each result to `out.jsonl` as you finish it, at least every 20 rows.
 > Only ever append to that file — never rewrite it, never rewrite earlier lines.
 
-See `examples/batch/` for a loop built this way.
+`examples/batch/` is a complete loop built this way: `check.sh` (the
+`--until` check and the `--progress` counter), `run.sh` (chunked prompts) and
+`dedupe.sh` (collapse the duplicate ids a retry leaves behind).
 
 ## Resumable tasks with --until
 

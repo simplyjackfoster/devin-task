@@ -18,6 +18,10 @@ jobs:
           bash -n scripts/devin-task
           bash -n install.sh
           bash -n tests/test_devin_task.sh
+          bash -n tests/test_examples_batch.sh
+          bash -n examples/batch/check.sh
+          bash -n examples/batch/run.sh
+          bash -n examples/batch/dedupe.sh
           bash -n tests/test_devin_task_acp.sh
           python3 -m py_compile scripts/devin-task-acp
 
@@ -26,3 +30,6 @@ jobs:
 
       - name: Run devin-task-acp test suite
         run: bash tests/test_devin_task_acp.sh
+
+      - name: Run examples/batch test suite (no live calls)
+        run: bash tests/test_examples_batch.sh
