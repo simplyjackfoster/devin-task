@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""devin-task-acp: run a one-shot task through `devin acp` (JSON-RPC 2.0 over stdio).
+
+An experimental sibling of scripts/devin-task. Instead of print mode it speaks the
+Agent Client Protocol, which gives live tool calls and a real permission callback:
+every shell command Devin wants to run comes back as a request we allow or cancel.
+
+Usage:
+  devin-task-acp [flags] "prompt"
+  devin-task-acp [flags] --prompt-file FILE
+  printf '%s' "$PROMPT" | devin-task-acp [flags]
+
+Flags:
+  --approve none|read|all  permission policy, default read (see decide())
+  --model M                default swe-1-7-medium (free)
+  --cwd DIR                session working directory
+  --timeout SECS           whole-run wall clock, default 600; exit 124 on timeout
+  --prompt-file FILE       read the prompt from FILE
+  --answer-only            accepted for parity; stdout is always just the answer
+  --json                   print {answer, session_id, stop_reason, usage, stats,
+                           denied, exit_code} instead of the plain answer
+  --trace                  tool calls and permission decisions to stderr, live
+
+Exit codes: 0 ok, 2 usage, 3 something was denied and the answer is empty,
+124 timeout, 143 killed by signal, 1 JSON-RPC or transport error.
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+
+CLIENT_NAME = "devin-task-acp"
+INITIALIZE_PARAMS = {
+    "protocolVersion": 1,
+    "clientCapabilities": {
+        "fs": {"readTextFile": False, "writeTextFile": False},
+        "terminal": False,
+    },
+    "clientInfo": {"name": CLIENT_NAME, "version": "0.1"},
+}
+EDITABLE_COMMAND = "cognition.ai/editableCommand"
+
+# Commands that cannot write a file by themselves, matched on the first word only.
+READ_COMMANDS = {
+    "cat", "head", "tail", "sed", "grep", "rg", "wc", "ls", "stat", "file",
+    "diff", "jq", "cut", "tr", "uniq", "pwd", "which", "git",
+}
+GIT_SUBCOMMANDS = {"log", "status", "diff", "show"}
+
+
+def decide(command, mode):
+    """Pure permission policy. True allows the command, False cancels it."""
+    if mode == "all":
+        return True
+    if mode == "none":
+        return False
+    words = (command or "").split()
+    if not words:
+        return False
+    if words[0] == "git":
+        return len(words) > 1 and words[1] in GIT_SUBCOMMANDS
+    return words[0] in READ_COMMANDS
+
+
+class RpcError(Exception):
+    """A JSON-RPC error response, or the server dying with requests in flight."""
+
+
+class RpcTimeout(Exception):
+    """The deadline passed while waiting for a response."""
+
+
+class AcpClient:
+    """Minimal JSON-RPC client for a newline-delimited-JSON stdio server.
+
+    A reader thread dispatches: responses land in the pending-id map, requests go
+    to on_request (whose return value is sent back as the result), notifications
+    go to on_notify. Child stderr is drained by its own thread so it cannot fill.
+    """
+
+    def __init__(self, argv, cwd, on_notify, on_request):
+        self.proc = subprocess.Popen(
+            argv, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1,
+        )
+        self.on_notify = on_notify
+        self.on_request = on_request
+        self.stderr_tail = deque(maxlen=40)
+        self._write_lock = threading.Lock()   # main thread and reader both write
+        self._pending = {}                    # id -> [Event, result, error]
+        self._pending_lock = threading.Lock()
+        self._next_id = 0
+        for target in (self._read_loop, self._drain_stderr):
+            threading.Thread(target=target, daemon=True).start()
+
+    # --- wire ---------------------------------------------------------------
+    def _send(self, obj):
+        line = json.dumps(obj) + "\n"
+        with self._write_lock:
+            try:
+                self.proc.stdin.write(line)
+                self.proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                pass
+
+    def notify(self, method, params):
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def request(self, method, params, deadline):
+        with self._pending_lock:
+            self._next_id += 1
+            rid = self._next_id
+            slot = [threading.Event(), None, None]
+            self._pending[rid] = slot
+        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        if not slot[0].wait(max(0.0, deadline - time.time())):
+            raise RpcTimeout(method)
+        if slot[2] is not None:
+            raise RpcError(slot[2])
+        return slot[1] or {}
+
+    def _resolve(self, rid, result, error):
+        with self._pending_lock:
+            slot = self._pending.pop(rid, None)
+        if slot is not None:
+            slot[1], slot[2] = result, error
+            slot[0].set()
+
+    def _read_loop(self):
+        try:
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("method") is not None:
+                    if "id" in msg:
+                        self._send({"jsonrpc": "2.0", "id": msg["id"],
+                                    "result": self.on_request(msg)})
+                    else:
+                        self.on_notify(msg)
+                elif "id" in msg:
+                    err = msg.get("error")
+                    self._resolve(msg["id"], msg.get("result"),
+                                  (err or {}).get("message", "unknown error")
+                                  if err else None)
+        except (ValueError, OSError):
+            pass
+        finally:  # EOF: nothing else will ever answer, so fail everything in flight
+            with self._pending_lock:
+                stranded, self._pending = list(self._pending.values()), {}
+            for slot in stranded:
+                slot[2] = "devin acp exited before answering"
+                slot[0].set()
+
+    def _drain_stderr(self):
+        try:
+            for line in self.proc.stderr:
+                self.stderr_tail.append(line.rstrip("\n"))
+        except (ValueError, OSError):
+            pass
+
+    # --- lifecycle ----------------------------------------------------------
+    def close(self, grace=2.0):
+        try:
+            self.proc.stdin.close()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        try:
+            self.proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            self.kill()
+
+    def kill(self):
+        if self.proc.poll() is not None:
+            return
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog=CLIENT_NAME, add_help=True,
+                                description="Run a task through `devin acp` (JSON-RPC over stdio).")
+    p.add_argument("--approve", choices=("none", "read", "all"), default="read")
+    p.add_argument("--model", default="swe-1-7-medium")
+    p.add_argument("--cwd")
+    p.add_argument("--timeout", type=float, default=600)
+    p.add_argument("--prompt-file")
+    p.add_argument("--answer-only", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--trace", action="store_true")
+    p.add_argument("prompt", nargs="?")
+    return p.parse_args(argv)
+
+
+def read_prompt(args, err):
+    if args.prompt_file:
+        try:
+            with open(args.prompt_file) as f:
+                return f.read()
+        except OSError as exc:
+            err("cannot read --prompt-file %s: %s" % (args.prompt_file, exc))
+            return None
+    if args.prompt:
+        return args.prompt
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return None
+
+
+def main(argv):
+    args = parse_args(argv)
+    warn = lambda msg: print("%s: %s" % (CLIENT_NAME, msg), file=sys.stderr)
+    trace = lambda msg: args.trace and print("[acp] %s" % msg, file=sys.stderr, flush=True)
+
+    prompt = read_prompt(args, warn)
+    if prompt is None or not prompt.strip():
+        warn("no prompt given (positional, --prompt-file or stdin)")
+        return 2
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        warn("--cwd %s is not a directory" % args.cwd)
+        return 2
+
+    answer, denied, stats = [], [], {}
+
+    def on_notify(msg):
+        params = msg.get("params") or {}
+        if msg.get("method") == "_cognition.ai/agent_stopped":
+            stats.update(params.get("stats") or {})
+            return
+        if msg.get("method") != "session/update":
+            return
+        update = params.get("update") or {}
+        kind = update.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            text = (update.get("content") or {}).get("text") or ""
+            answer.append(text)
+            if not args.json:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+        elif kind == "tool_call":
+            trace("tool: %s" % (update.get("title") or update.get("kind") or "?"))
+
+    def on_request(msg):
+        if msg.get("method") != "session/request_permission":
+            return {"outcome": {"outcome": "cancelled"}}
+        params = msg.get("params") or {}
+        call = params.get("toolCall") or {}
+        command = ((call.get("_meta") or {}).get(EDITABLE_COMMAND)
+                   or (call.get("rawInput") or {}).get("command")
+                   or call.get("title") or "")
+        if decide(command, args.approve):
+            ids = [o.get("optionId") for o in (params.get("options") or [])]
+            option = "allow_once" if "allow_once" in ids else (ids[0] if ids else "allow_once")
+            trace("allow: %s" % command)
+            return {"outcome": {"outcome": "selected", "optionId": option}}
+        denied.append(command)
+        print("denied: %s" % command, file=sys.stderr, flush=True)
+        return {"outcome": {"outcome": "cancelled"}}
+
+    try:
+        client = AcpClient(["devin", "acp", "--model", args.model], cwd, on_notify, on_request)
+    except OSError as exc:
+        warn("cannot start `devin acp`: %s" % exc)
+        return 1
+
+    session_id, stop_reason, usage, rc = "", "", {}, 0
+
+    def on_signal(_signum, _frame):
+        if session_id:
+            client.notify("session/cancel", {"sessionId": session_id})
+        time.sleep(0.25)
+        client.kill()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(143)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, on_signal)
+
+    deadline = time.time() + args.timeout
+    try:
+        client.request("initialize", INITIALIZE_PARAMS, deadline)
+        session_id = client.request(
+            "session/new", {"cwd": cwd, "mcpServers": []}, deadline).get("sessionId", "")
+        result = client.request(
+            "session/prompt",
+            {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]},
+            deadline)
+        stop_reason = result.get("stopReason", "")
+        usage = result.get("usage") or {}
+    except RpcTimeout:
+        warn("timed out after %gs" % args.timeout)
+        client.kill()
+        rc = 124
+    except RpcError as exc:
+        warn("devin acp: %s" % exc)
+        for line in list(client.stderr_tail)[-5:]:
+            print("  %s" % line, file=sys.stderr)
+        client.kill()
+        rc = 1
+    else:
+        client.close()
+
+    text = "".join(answer)
+    if rc == 0 and denied and not text.strip():
+        rc = 3
+
+    if args.json:
+        print(json.dumps({"answer": text, "session_id": session_id,
+                          "stop_reason": stop_reason, "usage": usage, "stats": stats,
+                          "denied": denied, "exit_code": rc}, indent=1))
+    else:
+        if text and not text.endswith("\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        summary = ["stop=%s" % (stop_reason or "none")]
+        summary += ["%s=%s" % (k, v) for k, v in stats.items()]
+        summary += ["%s=%s" % (k, v) for k, v in usage.items() if k not in stats]
+        if denied:
+            summary.append("denied=%d" % len(denied))
+        print("[acp] %s" % " ".join(summary), file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
