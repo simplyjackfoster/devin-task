@@ -223,6 +223,21 @@ reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity_then_ok "$WRAPPER" --re
 reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity "$WRAPPER" --retries 0 "x" 2>&1)"; rc=$?
 [ $rc -eq 6 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--retries 0 does not retry (exit 6 after 1 call)" || fail "--retries 0" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l)"
 
+echo "integer inputs are validated before anything runs"
+reset; out="$(DEVIN_TASK_RETRY_BASE=abc STUB_MODE=capacity "$WRAPPER" --retries 1 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "DEVIN_TASK_RETRY_BASE" && [ ! -f "$STUB_CALLS" ] \
+  && ok "non-integer DEVIN_TASK_RETRY_BASE -> exit 2 before any devin call (not exit 0)" \
+  || fail "RETRY_BASE validation" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) out=$out"
+reset; out="$("$WRAPPER" --retries abc "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && ! echo "$out" | grep -qi "integer expression expected" \
+  && ok "--retries abc -> exit 2, no bash arithmetic noise on stderr" || fail "--retries validation" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --timeout abc "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--timeout" && ok "--timeout abc -> exit 2" || fail "--timeout validation" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --timeout 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && ok "--timeout 0 -> exit 2 (a pass needs at least a second)" || fail "--timeout 0" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --max-passes 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--max-passes" && ok "--max-passes 0 -> exit 2" || fail "--max-passes validation" "rc=$rc out=$out"
+
 echo "--until loop"
 cat > "$TMP/check.sh" <<'CHK'
 #!/usr/bin/env bash
@@ -272,6 +287,11 @@ grep -qF "Your previous turn produced no message and no tool call. Continue the 
 echo "is_empty_turn tolerates a non-object export"
 reset; out="$(STUB_MODE=list_export "$WRAPPER" "do the task" 2>&1)"; rc=$?
 [ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ! echo "$out" | grep -q "Traceback" && ok "a non-object (e.g. list) export is treated as not-empty, no traceback, 1 call" || fail "non-object export" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) out=$out"
+reset; out="$(STUB_MODE=list_export "$WRAPPER" --json "do the task" 2>"$TMP/err")"; rc=$?
+! grep -q "Traceback" "$TMP/err" && echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["exit_code"]==0, d; assert d["session_id"]=="", d' 2>/dev/null \
+  && ok "--json over a non-object export: valid JSON on stdout, no traceback" || fail "--json non-object export" "rc=$rc out=$out err=$(cat "$TMP/err")"
+reset; out="$(STUB_MODE=list_export "$WRAPPER" --answer-only "do the task" 2>"$TMP/err")"; rc=$?
+! grep -q "Traceback" "$TMP/err" && ok "--answer-only over a non-object export: no traceback" || fail "--answer-only non-object export" "rc=$rc out=$out err=$(cat "$TMP/err")"
 
 echo "the nudge pass is retried like any other pass (--retries)"
 reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --retries 1 "do the task" 2>&1)"; rc=$?
