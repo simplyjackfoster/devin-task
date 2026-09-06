@@ -49,9 +49,13 @@ not look like forward motion. A pass that raises the number resets the stall
 counter and the run keeps going however long it takes; five passes in a row
 that do not raise it end the run with exit 5.
 
-The settings in `run.sh` — `--max-concurrent 5 --backoff 60 --retries 3` — are
-the ones that ran clean on the free tier for an hour. See the throughput table
-in the top-level [README](../../README.md#observed-throughput).
+The settings in `run.sh` — `--max-concurrent 5 --backoff 60 --retries 3
+--timeout 1200` — are the ones that ran clean on the free tier for an hour. The
+timeout is raised from the default 600 deliberately: at five concurrent the slow
+tail of passes runs past ten minutes, and the default would kill them at exit
+124 part-way through a chunk. Append-only output means even that is survivable,
+but there is no reason to invite it. See the throughput table in the top-level
+[README](../../README.md#observed-throughput).
 
 ## Adapting it
 

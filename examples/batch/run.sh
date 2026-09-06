@@ -9,7 +9,8 @@
 #   DEVIN_TASK    path to the wrapper                          (default devin-task on PATH)
 #
 # The settings below are the ones that ran clean on the free tier: five
-# concurrent sessions, a 60-second backoff base, three retries. --until decides
+# concurrent sessions, a 60-second backoff base, three retries, and a 1200s
+# per-pass timeout because the slow tail overruns the default 600. --until decides
 # success, --progress decides when to give up, so a chunk that keeps producing
 # rows is never cut off by a pass count.
 set -u
@@ -48,7 +49,9 @@ while :; do
     echo "Do not touch any other file. When ./check.sh --missing prints nothing you are done."
   } > "$PROMPT"
 
-  "$DEVIN_TASK" --yolo --cwd "$HERE" \
+  # --timeout 1200, not the default 600: at 5 concurrent the slow tail of
+  # passes runs past ten minutes and would be killed at exit 124 mid-chunk.
+  "$DEVIN_TASK" --yolo --cwd "$HERE" --timeout 1200 \
     --max-concurrent 5 --backoff 60 --retries 3 \
     --until 'test -z "$(./check.sh --missing)"' \
     --progress './check.sh --count' \
