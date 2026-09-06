@@ -117,8 +117,9 @@ kill and SIGTERM; a slot whose owner died is reclaimed. Waiting longer than
 `--slot-timeout SECS` (default 600) exits 6, which `--retries` re-attempts.
 For a batch job the settings that ran clean were
 `--max-concurrent 5 --backoff 60 --retries 3 --timeout 1200`. Raise the timeout
-from its 600s default: at five concurrent the slow tail of passes overruns ten
-minutes and would be killed at exit 124.
+from its 600s default: at five concurrent pass durations for identical work
+spread 57-904s, and about a quarter of them exceed 600s, so the default kills
+a large minority of passes at exit 124 rather than just an unlucky tail.
 
 ## Failure modes
 
