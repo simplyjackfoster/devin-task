@@ -390,6 +390,9 @@ reset; rm -f "$FLAKY_COUNT"
 out="$(STUB_MODE=advance "$WRAPPER" --until false --progress "$TMP/prog_flaky.sh" --max-stalls 2 "go" 2>&1)"; rc=$?
 [ $rc -eq 5 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "a --progress command that fails after pass 1 is a stall, not a usage error" || fail "flaky progress" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
 reset; echo 0 > "$TMP/counter"
+out="$(STUB_MODE=advance "$WRAPPER" --until "[ \"\$(cat $TMP/counter)\" -ge 3 ]" --progress "echo 'warning: deprecated' >&2; $PROG" "go" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "--progress reads stdout only, so a check that also writes to stderr is not a stall" || fail "progress stderr noise" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+reset; echo 0 > "$TMP/counter"
 STUB_MODE=advance "$WRAPPER" --until "[ \"\$(cat $TMP/counter)\" -ge 3 ]" --progress "$PROG" "go" >/dev/null 2>&1
 grep -q "now reports 1" "$STUB_PROMPT.2" && grep -q "+1 since the last pass" "$STUB_PROMPT.2" && ok "the resume prompt carries the --progress value and the delta" || fail "progress in prompt" "$(cat "$STUB_PROMPT.2" 2>&1)"
 grep -q "still fails" "$STUB_PROMPT.2" && ok "the resume prompt still carries the --until check output" || fail "check output lost" "$(cat "$STUB_PROMPT.2" 2>&1)"

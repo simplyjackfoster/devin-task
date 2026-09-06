@@ -20,7 +20,7 @@
 #   --until CMD          rerun (resuming the session) until `bash -c CMD` exits 0
 #   --max-passes N       cap for --until, default 5; exit 5 when exhausted
 #   --progress CMD       after each --until pass run `bash -c CMD`; it must print
-#                        one integer (rows done, files written, ...). A pass that
+#                        one integer on stdout (rows done, files, ...). A pass that
 #                        does not raise it is a stall. While the number keeps
 #                        rising the run is unbounded: --progress replaces
 #                        --max-passes as the bound on an --until loop
@@ -394,11 +394,12 @@ sys.exit(0 if not has_msg and not has_tools else 1)
 PY
 }
 
-# ---- run the --progress command. Sets PROG_NEW to the integer it printed, or
-# to the empty string when the command failed or printed anything that is not a
-# single integer; PROG_RAW/PROG_RC keep the raw result for the error message. ----
+# ---- run the --progress command. Sets PROG_NEW to the integer it printed on
+# STDOUT, or to the empty string when the command failed or printed anything
+# that is not a single integer; stderr is kept out of the value (a check that
+# warns is not a broken check) but is quoted back in the error message. ----
 read_progress() {
-  PROG_RAW="$(bash -c "$PROGRESS" 2>&1)"; PROG_RC=$?
+  PROG_RAW="$(bash -c "$PROGRESS" 2>"$WORK/progress.err")"; PROG_RC=$?
   PROG_NEW="$(printf '%s' "$PROG_RAW" | tr -d '[:space:]')"
   case "$PROG_NEW" in ''|*[!0-9]*) PROG_NEW="" ;; esac
   [ $PROG_RC -eq 0 ] || PROG_NEW=""
@@ -414,7 +415,7 @@ printf '%s' "$PROMPT" > "$WORK/prompt.md"
 # before the first Devin call; from pass 1 on the same result is a stall.
 if [ -n "$PROGRESS" ]; then
   read_progress
-  [ -n "$PROG_NEW" ] || die "--progress command must print a single integer on stdout and exit 0; got exit $PROG_RC and: $(printf '%s' "$PROG_RAW" | tr '\n' ' ' | cut -c1-160)"
+  [ -n "$PROG_NEW" ] || die "--progress command must print a single integer on stdout and exit 0; got exit $PROG_RC, stdout: $(printf '%s' "$PROG_RAW" | tr '\n' ' ' | cut -c1-120) stderr: $(tr '\n' ' ' < "$WORK/progress.err" 2>/dev/null | cut -c1-120)"
   PROG_VALUE="$PROG_NEW"
   [ $TRACE -eq 1 ] && echo "[devin-task] progress baseline: $PROG_VALUE" >&2
 fi

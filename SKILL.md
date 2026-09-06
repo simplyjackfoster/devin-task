@@ -160,4 +160,4 @@ For a batch job the settings that ran clean were
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (106 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (107 stub-devin checks plus two live calls).
