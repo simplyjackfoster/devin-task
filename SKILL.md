@@ -19,7 +19,8 @@ devin-task --json "prompt"                            # {answer, session_id, exi
 devin-task --yolo --until 'python3 check.py' --max-passes 12 "prompt"   # loop until check exits 0
 devin-task --inherit-env --yolo "prompt"              # tell Devin which python3/node to use
 devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
-devin-task --retries 2 "prompt"                       # retry capacity/rate-limit failures (exit 6)
+devin-task --retries 2 "prompt"                       # retry connection/capacity/rate-limit failures (exit 6)
+devin-task --retries 3 --backoff 60 "prompt"          # 60s x attempt between retries (default 30)
 devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
 ```
 
@@ -82,10 +83,13 @@ models. Each run has its own session, temp prompt and export.
 - Exit 3: refused action. The message names the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
 - Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
-- Exit 6: upstream capacity or rate-limit error (retryable). The wrapper already
-  retries these itself up to `--retries N` times (default 1), sleeping `5 ×
-  attempt` seconds between attempts, before giving up with exit 6. Retry the
-  whole `devin-task` call again, or raise `--retries`.
+- Exit 6: upstream connection error, capacity or rate-limit error (retryable).
+  Devin's own "Connection error, send a message to continue retrying" counts.
+  The wrapper already retries these itself up to `--retries N` times
+  (default 1), sleeping `backoff × attempt` seconds between attempts — the base
+  is `--backoff SECS` (default 30, or `DEVIN_TASK_RETRY_BASE`; the flag wins) —
+  before giving up with exit 6. Retry the whole `devin-task` call again, or
+  raise `--retries`.
 - Exit 7: upstream internal error. Not retried automatically; re-run if it looks transient.
 - Exit 8: authentication failure (bad/expired credentials). Run `devin auth status`;
   a refused action (exit 3) is not this — internal-error text inside a
@@ -100,8 +104,9 @@ models. Each run has its own session, temp prompt and export.
   other pass, and does consume the retry budget.
 - Exit 143: the wrapper itself was killed by SIGTERM or SIGINT. It kills
   Devin's process tree on the way out, so nothing is left running.
-- Exit 2 also covers a non-integer `--retries`, `--timeout`, `--max-passes` or
-  `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
+- Exit 2 also covers a non-integer `--retries`, `--backoff`, `--timeout`,
+  `--max-passes` or `DEVIN_TASK_RETRY_BASE`; these are checked before the first
+  pass.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -114,4 +119,4 @@ models. Each run has its own session, temp prompt and export.
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (77 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (82 stub-devin checks plus two live calls).

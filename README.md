@@ -60,19 +60,22 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--inherit-env` | prepend the caller's `python3`, `node` and `CONDA_PREFIX` so Devin uses them |
 | `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
-| `--retries N` | retry capacity/rate-limit failures (exit 6) only, default 1; sleeps `5 × attempt` seconds between attempts, overridable via `DEVIN_TASK_RETRY_BASE` |
+| `--retries N` | retry connection/capacity/rate-limit failures (exit 6) only, default 1; sleeps `backoff × attempt` seconds between attempts |
+| `--backoff S` | retry backoff base in seconds, default 30; also `DEVIN_TASK_RETRY_BASE`, which the flag overrides |
 | `--no-empty-retry` | don't nudge-resume an empty turn (below) once; detection still runs and still exits 9 |
 | `--answer-only` | print only Devin's final message |
 | `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is; `passes` counts only `--until` passes — a nudge pass (below) is never counted |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
-6 capacity or rate limit (retryable), 7 upstream internal error,
+6 connection error, capacity or rate limit (retryable), 7 upstream internal error,
 8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout,
 143 the wrapper was killed by SIGTERM or SIGINT.
 
-`--retries`, `--timeout` and `--max-passes` (and `DEVIN_TASK_RETRY_BASE`) are
-checked before the first pass; a non-integer value is a usage error (exit 2).
+`--retries`, `--backoff`, `--timeout` and `--max-passes` (and
+`DEVIN_TASK_RETRY_BASE`) are checked before the first pass; a non-integer value
+is a usage error (exit 2). `--backoff` is validated after it overrides
+`DEVIN_TASK_RETRY_BASE`, so a bad env value with a good flag is fine.
 
 ### Classifying upstream failures, and `--retries`
 
@@ -80,23 +83,27 @@ When a pass exits non-zero, the wrapper scans Devin's stderr (and captured
 stdout) for known upstream failure text, checked in this order so a
 transient error is never misread as a dead login:
 
-1. **capacity** (exit 6) — `high demand`, `try again later`, `currently
+1. **connection error** (exit 6) — `connection error`, the CLI's
+   "Connection error, send a message to continue retrying"
+2. **capacity** (exit 6) — `high demand`, `try again later`, `currently
    busy/overloaded/at capacity`, `server is busy`, `overloaded`, `capacity`
-2. **internal error** (exit 7) — `internal error occurred` / `internal
+3. **internal error** (exit 7) — `internal error occurred` / `internal
    error`. Devin sometimes wraps this inside a 401/403-looking message, so
    it is matched before the auth patterns below.
-3. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
+4. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
    `unauthorized`, `invalid ... api key/token`, `authentication failed`
-4. **rate limit** (exit 6) — `rate limit`, `too many requests`,
+5. **rate limit** (exit 6) — `rate limit`, `too many requests`,
    `resource_exhausted`
 
 The existing refusal detection (a rejected tool call → exit 3) keeps
-precedence over all of these. Only exit-6 conditions (capacity, rate limit)
-are retried, up to `--retries N` times (default 1), sleeping `5 × attempt`
-seconds between attempts (5s, then 10s, ...) before re-running the same
-pass — a fresh pass, not a session resume, though a pass already resumed
-under `--until` stays resumed. Set `DEVIN_TASK_RETRY_BASE` to change the
-5-second base (tests use `0`).
+precedence over all of these. Only exit-6 conditions (connection error,
+capacity, rate limit) are retried, up to `--retries N` times (default 1),
+sleeping `backoff × attempt` seconds between attempts (30s, then 60s, ...)
+before re-running the same pass — a fresh pass, not a session resume, though a
+pass already resumed under `--until` stays resumed. `--backoff SECS` sets the
+base, defaulting to 30; `DEVIN_TASK_RETRY_BASE` does the same and the flag wins
+(tests use `--backoff 0`). The default was raised from 5 to 30 because the rate
+limits observed at concurrency needed roughly 60 seconds to clear.
 
 ### Empty turns and `--no-empty-retry`
 
@@ -202,7 +209,7 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Seventy-seven checks against a stub `devin` on PATH (argv, generated config and
+Eighty-two checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries`, integer
 validation of the numeric flags, the `--until` loop, empty-turn detection and

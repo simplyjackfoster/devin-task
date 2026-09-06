@@ -19,18 +19,19 @@
 #   --inherit-env        prepend the caller's python3/node paths and CONDA_PREFIX
 #   --until CMD          rerun (resuming the session) until `bash -c CMD` exits 0
 #   --max-passes N       cap for --until, default 5; exit 5 when exhausted
-#   --retries N          retry capacity/rate-limit failures (exit 6), default 1;
-#                        sleeps 5*attempt seconds between attempts, overridable
-#                        via DEVIN_TASK_RETRY_BASE (seconds)
+#   --retries N          retry connection/capacity/rate-limit failures (exit 6),
+#                        default 1; sleeps backoff*attempt seconds between attempts
+#   --backoff SECS       retry backoff base in seconds, default 30 (env:
+#                        DEVIN_TASK_RETRY_BASE; the flag wins over the env var)
 #   --no-empty-retry     don't nudge-resume an empty turn once; still exit 9
 # Output:
 #   --answer-only        print only Devin's final message
 #   --json               print {answer, session_id, exit_code, passes, tool_calls}
 #   --trace              heartbeat to stderr while running; tool-call list after
 #
-# On a failed pass, Devin's stderr/stdout is classified (transient-first: capacity,
-# internal error, auth, rate limit); the refusal check above keeps precedence over
-# this classification.
+# On a failed pass, Devin's stderr/stdout is classified (transient-first: connection
+# error, capacity, internal error, auth, rate limit); the refusal check above keeps
+# precedence over this classification.
 #
 # An "empty turn" (a pass that exits 0 with no agent message and no tool call) is
 # a known upstream failure on swe-1-7* models. The wrapper resumes the session
@@ -47,7 +48,7 @@ set -u
 MODEL="swe-1-7-medium"; PERM="auto"; TIMEOUT=600; CWD=""
 PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
 ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
-RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-5}"
+RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-30}"; BACKOFF=""; BACKOFF_SET=0
 NO_EMPTY_RETRY=0
 NUDGE_PROMPT='Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer.'
 ALLOW_EXTRA=()
@@ -67,7 +68,7 @@ kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL straggl
   local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
   kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
 }
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
 
 # ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
@@ -75,7 +76,10 @@ die()   { echo "devin-task: $*" >&2; exit 2; }
 classify_failure() {  # $1 stderr-file  $2 stdout-file
   local text
   text="$(cat "$1" "$2" 2>/dev/null)"
-  if printf '%s' "$text" | grep -qiE 'high demand|try again later|currently (busy|overloaded|at capacity)|temporarily (busy|overloaded|unavailable)|server is busy|overloaded|capacity'; then
+  if printf '%s' "$text" | grep -qiE 'connection error'; then
+    echo "devin-task: upstream failure classified as connection error (retryable); exit 6" >&2
+    RC=6
+  elif printf '%s' "$text" | grep -qiE 'high demand|try again later|currently (busy|overloaded|at capacity)|temporarily (busy|overloaded|unavailable)|server is busy|overloaded|capacity'; then
     echo "devin-task: upstream failure classified as capacity (retryable); exit 6" >&2
     RC=6
   elif printf '%s' "$text" | grep -qiE 'internal error occurred|internal error'; then
@@ -104,6 +108,7 @@ while [ $# -gt 0 ]; do
     --until)       UNTIL="$2"; shift 2 ;;
     --max-passes)  MAX_PASSES="$2"; shift 2 ;;
     --retries)     RETRIES="$2"; shift 2 ;;
+    --backoff)     BACKOFF="$2"; BACKOFF_SET=1; shift 2 ;;
     --no-empty-retry) NO_EMPTY_RETRY=1; shift ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --answer-only) ANSWER_ONLY=1; shift ;;
@@ -119,7 +124,8 @@ done
 # ---- integer inputs: an unvalidated one aborts an arithmetic expansion under
 # set -u mid-run, which would fire the EXIT trap and exit 0 after a failed pass ----
 case "$RETRIES" in ''|*[!0-9]*) die "--retries needs a non-negative integer (got '$RETRIES')" ;; esac
-case "$RETRY_BASE" in ''|*[!0-9]*) die "DEVIN_TASK_RETRY_BASE needs a non-negative integer (got '$RETRY_BASE')" ;; esac
+[ $BACKOFF_SET -eq 1 ] && RETRY_BASE="$BACKOFF"
+case "$RETRY_BASE" in ''|*[!0-9]*) die "--backoff / DEVIN_TASK_RETRY_BASE needs a non-negative integer (got '$RETRY_BASE')" ;; esac
 case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout needs a positive integer (got '$TIMEOUT')" ;; esac
 [ "$TIMEOUT" -ge 1 ] || die "--timeout needs a positive integer (got '$TIMEOUT')"
 case "$MAX_PASSES" in ''|*[!0-9]*) die "--max-passes needs a positive integer (got '$MAX_PASSES')" ;; esac

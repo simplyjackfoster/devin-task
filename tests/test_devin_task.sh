@@ -44,6 +44,15 @@ case "${STUB_MODE:-ok}" in
   internal)  echo "Error: internal error occurred (trace ID: abcd1234)" >&2; exit 1 ;;
   auth)      echo "Error: request unauthorized: invalid api key" >&2; exit 1 ;;
   ratelimit) echo "Error: too many requests, rate limit exceeded" >&2; exit 1 ;;
+  connection) echo "Connection error, send a message to continue retrying" >&2; exit 1 ;;
+  connection_then_ok)
+    if [ "$n" -lt 2 ]; then
+      echo "Connection error, send a message to continue retrying" >&2; exit 1
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
   internal_in_auth) echo "Error: unauthorized - internal error occurred (trace ID: zz99)" >&2; exit 1 ;;
   capacity_then_ok)
     if [ "$n" -lt 3 ]; then
@@ -170,7 +179,7 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
 out="$("$WRAPPER" --help 2>&1)"; rc=$?
-[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
@@ -212,16 +221,29 @@ reset; out="$(STUB_MODE=auth "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 8 ] && echo "$out" | grep -qi "auth" && ok "auth text -> exit 8" || fail "auth classification" "rc=$rc $out"
 reset; out="$(STUB_MODE=ratelimit "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 6 ] && echo "$out" | grep -qi "rate limit" && ok "rate limit text -> exit 6" || fail "ratelimit classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=connection "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && echo "$out" | grep -qi "connection error" && ok "Devin's 'Connection error, send a message to continue retrying' -> exit 6" || fail "connection classification" "rc=$rc $out"
 reset; out="$(STUB_MODE=internal_in_auth "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 7 ] && ok "internal-inside-auth text -> exit 7, not 8 (transient-first ordering)" || fail "internal-in-auth ordering" "rc=$rc $out"
 reset; out="$(STUB_MODE=reject "$WRAPPER" "x" 2>&1)"; rc=$?
 [ $rc -eq 3 ] && ok "refusal detection keeps precedence over classification -> exit 3" || fail "refusal precedence" "rc=$rc $out"
 
 echo "--retries"
-reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity_then_ok "$WRAPPER" --retries 2 "x" 2>&1)"; rc=$?
+reset; out="$(STUB_MODE=capacity_then_ok "$WRAPPER" --backoff 0 --retries 2 "x" 2>&1)"; rc=$?
 [ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "--retries 2 retries capacity failures then succeeds (3 calls)" || fail "--retries 2" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
-reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity "$WRAPPER" --retries 0 "x" 2>&1)"; rc=$?
+reset; out="$(STUB_MODE=capacity "$WRAPPER" --backoff 0 --retries 0 "x" 2>&1)"; rc=$?
 [ $rc -eq 6 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--retries 0 does not retry (exit 6 after 1 call)" || fail "--retries 0" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l)"
+reset; out="$(STUB_MODE=connection_then_ok "$WRAPPER" --backoff 0 --retries 1 "x" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "a connection error is retried under --retries (2 calls, exit 0)" || fail "connection retried" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+
+echo "--backoff"
+reset; out="$(DEVIN_TASK_RETRY_BASE=abc STUB_MODE=capacity_then_ok "$WRAPPER" --backoff 0 --retries 2 "x" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "--backoff wins over DEVIN_TASK_RETRY_BASE (a bad env value is never validated)" || fail "--backoff over env" "rc=$rc $out"
+reset; out="$("$WRAPPER" --backoff abc "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--backoff" && [ ! -f "$STUB_CALLS" ] && ok "--backoff abc -> exit 2 before any devin call" || fail "--backoff validation" "rc=$rc out=$out"
+start=$(date +%s); reset; out="$(STUB_MODE=capacity "$WRAPPER" --backoff 1 --retries 2 "x" 2>&1)"; rc=$?
+elapsed=$(( $(date +%s) - start ))
+[ $rc -eq 6 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && [ "$elapsed" -ge 3 ] && ok "sleep stays backoff x attempt (--backoff 1, 2 retries, >=1+2s)" || fail "--backoff formula" "rc=$rc elapsed=$elapsed calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l)"
 
 echo "integer inputs are validated before anything runs"
 reset; out="$(DEVIN_TASK_RETRY_BASE=abc STUB_MODE=capacity "$WRAPPER" --retries 1 "x" 2>&1)"; rc=$?
@@ -294,7 +316,7 @@ reset; out="$(STUB_MODE=list_export "$WRAPPER" --answer-only "do the task" 2>"$T
 ! grep -q "Traceback" "$TMP/err" && ok "--answer-only over a non-object export: no traceback" || fail "--answer-only non-object export" "rc=$rc out=$out err=$(cat "$TMP/err")"
 
 echo "the nudge pass is retried like any other pass (--retries)"
-reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --retries 1 "do the task" 2>&1)"; rc=$?
+reset; out="$(STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --backoff 0 --retries 1 "do the task" 2>&1)"; rc=$?
 [ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "a capacity failure during the nudge is retried like the main pass (3 calls, exit 0)" || fail "nudge retried" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
 
 if [ "${DEVIN_TASK_TEST_NO_LIVE:-0}" = "1" ]; then
