@@ -307,7 +307,7 @@ bash tests/test_devin_task.sh
 bash tests/test_examples_batch.sh
 ```
 
-A hundred and twenty-two checks against a stub `devin` on PATH (argv, generated config and
+A hundred and twenty-three checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries` and
 `--backoff`, integer validation of the numeric flags, the `--max-concurrent`

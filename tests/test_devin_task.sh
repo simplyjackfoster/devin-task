@@ -502,7 +502,15 @@ echo "$err" | grep -qE "devin-task: [0-9]+s elapsed, [0-9]+ tool calls, exit 124
 reset; err="$(STUB_MODE=capacity "$WRAPPER" --summary --retries 0 "x" 2>&1 >/dev/null)"
 echo "$err" | grep -qE "exit 6$" && ok "a classified failure's summary carries the classified exit code" || fail "summary rc6" "$err"
 err="$("$WRAPPER" --summary --timeout abc "x" 2>&1 >/dev/null)"
-! echo "$err" | grep -q "elapsed" && ok "a usage error prints no summary (nothing ran)" || fail "summary on usage error" "$err"
+! echo "$err" | grep -q "elapsed" && ok "a flag-validation usage error prints no summary (nothing ran)" || fail "summary on usage error" "$err"
+# ...but the --progress baseline check runs after the EXIT trap is installed, so
+# that one usage error does report a summary. Pinning it: the comment in the
+# wrapper used to claim every exit 2 predates the trap, which stopped being true
+# when --progress landed.
+reset; err="$("$WRAPPER" --summary --until false --progress "echo many" "go" 2>&1 >/dev/null)"; rc=$?
+[ $rc -eq 2 ] && echo "$err" | grep -qE "devin-task: [0-9]+s elapsed, [0-9]+ tool calls, exit 2" \
+  && ok "the --progress baseline usage error comes after the trap, so it does report a summary (exit 2)" \
+  || fail "summary on progress usage error" "rc=$rc $err"
 
 if [ "${DEVIN_TASK_TEST_NO_LIVE:-0}" = "1" ]; then
   echo "live: skipped"
