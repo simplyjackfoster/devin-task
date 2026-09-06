@@ -94,12 +94,19 @@ capacity varies by the hour.
 | Setup | Throughput | Notes |
 |---|---|---|
 | 1 session | ~100 rows / 8 min | steady, no throttling |
-| 5 concurrent | ~60 rows / 5–8 min **each** | ran clean for an hour |
+| 5 concurrent | ~60 rows / 3–14 min **each**, median ~7 (n=34 passes) | ran clean for an hour |
 | 8 concurrent | — | hard drop-off: throttled on about a third of passes |
 
 `--max-concurrent 5 --backoff 60` were the settings that ran clean. Five is the
 ceiling worth planning around; eight buys nothing, because the retries the
 throttling forces cost more than the extra sessions add.
+
+Mind the spread on that middle row. The median pass is comfortable but the tail
+is long — individual sessions grind — and **the slowest passes run past the
+default `--timeout` of 600 seconds**, which kills them at exit 124. For batch
+work raise `--timeout` (1200 is a reasonable starting point at 5 concurrent),
+and keep the output append-only as described below, so a pass that is killed
+anyway still banks the rows it had written.
 
 ### Classifying upstream failures, and `--retries`
 
@@ -307,7 +314,7 @@ bash tests/test_devin_task.sh
 bash tests/test_examples_batch.sh
 ```
 
-A hundred and twenty-two checks against a stub `devin` on PATH (argv, generated config and
+A hundred and twenty-three checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries` and
 `--backoff`, integer validation of the numeric flags, the `--max-concurrent`
