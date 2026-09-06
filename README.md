@@ -170,6 +170,15 @@ in one directory do not collide) with the check's exit code and last 40 lines
 of output. Write checks that print what is missing. Run loops in the
 background from Claude Code: the Bash tool caps a call at 600s.
 
+### Checkpoint the output
+
+For any task producing many rows or files, tell Devin in the prompt to append
+its output every 20 rows or so and to write append-only, never rewriting the
+file — a pass that hits the 600-second timeout otherwise leaves nothing behind.
+The rule and an example prompt fragment are in
+[SKILL.md](SKILL.md#writing-the-prompt), and `examples/batch/` is a loop built
+on it.
+
 ### Progress-based stopping: `--progress` and `--max-stalls`
 
 `--max-passes` is the wrong bound for a job whose size you do not know up

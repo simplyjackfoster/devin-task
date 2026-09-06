@@ -66,6 +66,20 @@ and use `--prompt-file`; the wrapper never passes prompts through the shell.
 Devin's plain stdout concatenates its progress messages without newlines, so
 for anything parsed use `--answer-only` or `--json`.
 
+**Checkpoint the output.** For any task that produces many rows or files, tell
+Devin in the prompt to append its output early and often — every 20 rows or so
+— and to write append-only, never rewriting the output file. A pass that hits
+the 600-second `--timeout` otherwise leaves nothing at all behind, because
+Devin was still holding the whole result to write at the end. Across a
+300-pass run, killed and timed-out passes with append-only output never lost or
+corrupted a row; the cost is duplicate ids after a retry, which a dedupe pass
+collapses. Two lines in the prompt do it:
+
+> Append each result to `out.jsonl` as you finish it, at least every 20 rows.
+> Only ever append to that file — never rewrite it, never rewrite earlier lines.
+
+See `examples/batch/` for a loop built this way.
+
 ## Resumable tasks with --until
 
 `--until CMD` runs `bash -c CMD` in the working directory after each pass.
