@@ -60,7 +60,7 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
 | `--answer-only` | print only Devin's final message |
-| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}` |
+| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted, 124 timeout.
@@ -145,6 +145,11 @@ Forty-nine checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, the `--until` loop) plus two live calls on the
 free model.
+
+If you edit `scripts/devin-task` while a run is in flight, write to a temp
+file and `mv` it over: bash reads scripts incrementally, so rewriting the file
+in place can make a running wrapper resume parsing mid-file when its wait
+loop ends.
 
 ## Layout
 
