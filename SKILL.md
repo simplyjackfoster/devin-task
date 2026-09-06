@@ -19,6 +19,7 @@ devin-task --json "prompt"                            # {answer, session_id, exi
 devin-task --yolo --until 'python3 check.py' --max-passes 12 "prompt"   # loop until check exits 0
 devin-task --inherit-env --yolo "prompt"              # tell Devin which python3/node to use
 devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
+devin-task --retries 2 "prompt"                       # retry capacity/rate-limit failures (exit 6)
 ```
 
 From the Bash tool pass `timeout: 600000` or use `run_in_background: true`;
@@ -79,6 +80,14 @@ models. Each run has its own session, temp prompt and export.
 - Exit 3: refused action. The message names the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
 - Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
+- Exit 6: upstream capacity or rate-limit error (retryable). The wrapper already
+  retries these itself up to `--retries N` times (default 1), sleeping `5 ×
+  attempt` seconds between attempts, before giving up with exit 6. Retry the
+  whole `devin-task` call again, or raise `--retries`.
+- Exit 7: upstream internal error. Not retried automatically; re-run if it looks transient.
+- Exit 8: authentication failure (bad/expired credentials). Run `devin auth status`;
+  a refused action (exit 3) is not this — internal-error text inside a
+  401/403-looking message is classified as exit 7, not 8.
 - Empty stdout with exit 0 should not happen; check stderr.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The

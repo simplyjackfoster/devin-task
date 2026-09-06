@@ -31,6 +31,19 @@ case "${STUB_MODE:-ok}" in
     [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\",\"tool_calls\":[{\"function_name\":\"exec\",\"arguments\":{\"command\":\"wc -l f.txt\"}}]},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{\"total_steps\":3}}" > "$EXPORT" ;;
   reject) echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2; exit 0 ;;
   hang)   sleep 30; echo "never" ;;
+  capacity)  echo "Error: the servers are currently overloaded, please try again later" >&2; exit 1 ;;
+  internal)  echo "Error: internal error occurred (trace ID: abcd1234)" >&2; exit 1 ;;
+  auth)      echo "Error: request unauthorized: invalid api key" >&2; exit 1 ;;
+  ratelimit) echo "Error: too many requests, rate limit exceeded" >&2; exit 1 ;;
+  internal_in_auth) echo "Error: unauthorized - internal error occurred (trace ID: zz99)" >&2; exit 1 ;;
+  capacity_then_ok)
+    if [ "$n" -lt 3 ]; then
+      echo "Error: currently overloaded, try again later" >&2; exit 1
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
 esac
 STUB
 chmod +x "$TMP/bin/devin"
@@ -118,6 +131,26 @@ reset; out="$(STUB_MODE=hang "$WRAPPER" --timeout 2 "slow" 2>&1)"; rc=$?
 STUB_MODE=hang "$WRAPPER" --timeout 30 "slow" >/dev/null 2>&1 &
 wpid=$!; sleep 1; kill -TERM "$wpid"; sleep 2
 if pgrep -f "$TMP/bin/devin" >/dev/null; then fail "SIGTERM to wrapper kills devin child"; pkill -f "$TMP/bin/devin"; else ok "SIGTERM to wrapper kills devin child"; fi
+
+echo "failure classification"
+reset; out="$(STUB_MODE=capacity "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && echo "$out" | grep -qi "capacity" && ok "capacity text -> exit 6" || fail "capacity classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=internal "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 7 ] && echo "$out" | grep -qi "internal" && ok "internal error text -> exit 7" || fail "internal classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=auth "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 8 ] && echo "$out" | grep -qi "auth" && ok "auth text -> exit 8" || fail "auth classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=ratelimit "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && echo "$out" | grep -qi "rate limit" && ok "rate limit text -> exit 6" || fail "ratelimit classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=internal_in_auth "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 7 ] && ok "internal-inside-auth text -> exit 7, not 8 (transient-first ordering)" || fail "internal-in-auth ordering" "rc=$rc $out"
+reset; out="$(STUB_MODE=reject "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ok "refusal detection keeps precedence over classification -> exit 3" || fail "refusal precedence" "rc=$rc $out"
+
+echo "--retries"
+reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity_then_ok "$WRAPPER" --retries 2 "x" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "--retries 2 retries capacity failures then succeeds (3 calls)" || fail "--retries 2" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity "$WRAPPER" --retries 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--retries 0 does not retry (exit 6 after 1 call)" || fail "--retries 0" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l)"
 
 echo "--until loop"
 cat > "$TMP/check.sh" <<'CHK'

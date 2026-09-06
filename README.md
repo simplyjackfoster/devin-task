@@ -59,11 +59,38 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--inherit-env` | prepend the caller's `python3`, `node` and `CONDA_PREFIX` so Devin uses them |
 | `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
+| `--retries N` | retry capacity/rate-limit failures (exit 6) only, default 1; sleeps `5 × attempt` seconds between attempts, overridable via `DEVIN_TASK_RETRY_BASE` |
 | `--answer-only` | print only Devin's final message |
 | `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
-Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted, 124 timeout.
+Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
+6 capacity or rate limit (retryable), 7 upstream internal error,
+8 authentication failure, 124 timeout.
+
+### Classifying upstream failures, and `--retries`
+
+When a pass exits non-zero, the wrapper scans Devin's stderr (and captured
+stdout) for known upstream failure text, checked in this order so a
+transient error is never misread as a dead login:
+
+1. **capacity** (exit 6) — `high demand`, `try again later`, `currently
+   busy/overloaded/at capacity`, `server is busy`, `overloaded`, `capacity`
+2. **internal error** (exit 7) — `internal error occurred` / `internal
+   error`. Devin sometimes wraps this inside a 401/403-looking message, so
+   it is matched before the auth patterns below.
+3. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
+   `unauthorized`, `invalid ... api key/token`, `authentication failed`
+4. **rate limit** (exit 6) — `rate limit`, `too many requests`,
+   `resource_exhausted`
+
+The existing refusal detection (a rejected tool call → exit 3) keeps
+precedence over all of these. Only exit-6 conditions (capacity, rate limit)
+are retried, up to `--retries N` times (default 1), sleeping `5 × attempt`
+seconds between attempts (5s, then 10s, ...) before re-running the same
+pass — a fresh pass, not a session resume, though a pass already resumed
+under `--until` stays resumed. Set `DEVIN_TASK_RETRY_BASE` to change the
+5-second base (tests use `0`).
 
 ### Read-only shell allowlist
 
@@ -141,9 +168,10 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Forty-nine checks against a stub `devin` on PATH (argv, generated config and
+Fifty-five checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
-timeout, signal propagation, the `--until` loop) plus two live calls on the
+timeout, signal propagation, failure classification, `--retries`, the
+`--until` loop) plus two live calls on the
 free model.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp

@@ -18,17 +18,27 @@
 #   --inherit-env        prepend the caller's python3/node paths and CONDA_PREFIX
 #   --until CMD          rerun (resuming the session) until `bash -c CMD` exits 0
 #   --max-passes N       cap for --until, default 5; exit 5 when exhausted
+#   --retries N          retry capacity/rate-limit failures (exit 6), default 1;
+#                        sleeps 5*attempt seconds between attempts, overridable
+#                        via DEVIN_TASK_RETRY_BASE (seconds)
 # Output:
 #   --answer-only        print only Devin's final message
 #   --json               print {answer, session_id, exit_code, passes, tool_calls}
 #   --trace              heartbeat to stderr while running; tool-call list after
 #
-# Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted, 124 timeout.
+# On a failed pass, Devin's stderr/stdout is classified (transient-first: capacity,
+# internal error, auth, rate limit); the refusal check above keeps precedence over
+# this classification.
+#
+# Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted,
+#             6 capacity or rate limit (retryable), 7 upstream internal error,
+#             8 authentication failure, 124 timeout.
 set -u
 
 MODEL="swe-1-7-medium"; PERM="auto"; TIMEOUT=600; CWD=""
 PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
 ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
+RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-5}"
 ALLOW_EXTRA=()
 HEARTBEAT="${DEVIN_TASK_HEARTBEAT:-30}"
 USER_CONFIG="${DEVIN_TASK_USER_CONFIG:-$HOME/.config/devin/config.json}"
@@ -46,8 +56,28 @@ kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL straggl
   local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
   kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
 }
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
+
+# ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
+# Transient-first order: capacity, internal error, auth, rate limit.
+classify_failure() {  # $1 stderr-file  $2 stdout-file
+  local text
+  text="$(cat "$1" "$2" 2>/dev/null)"
+  if printf '%s' "$text" | grep -qiE 'high demand|try again later|currently (busy|overloaded|at capacity)|temporarily (busy|overloaded|unavailable)|server is busy|overloaded|capacity'; then
+    echo "devin-task: upstream failure classified as capacity (retryable); exit 6" >&2
+    RC=6
+  elif printf '%s' "$text" | grep -qiE 'internal error occurred|internal error'; then
+    echo "devin-task: upstream failure classified as internal error; exit 7" >&2
+    RC=7
+  elif printf '%s' "$text" | grep -qiE 'permission_denied|unauthenticated|unauthorized|invalid.*(api ?key|token)|authentication failed'; then
+    echo "devin-task: upstream failure classified as authentication failure; exit 8" >&2
+    RC=8
+  elif printf '%s' "$text" | grep -qiE 'rate.?limit|too many requests|resource_exhausted'; then
+    echo "devin-task: upstream failure classified as rate limit (retryable); exit 6" >&2
+    RC=6
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -61,6 +91,7 @@ while [ $# -gt 0 ]; do
     --inherit-env) INHERIT_ENV=1; shift ;;
     --until)       UNTIL="$2"; shift 2 ;;
     --max-passes)  MAX_PASSES="$2"; shift 2 ;;
+    --retries)     RETRIES="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --answer-only) ANSWER_ONLY=1; shift ;;
     --json)        JSON=1; shift ;;
@@ -160,6 +191,8 @@ run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdou
     esac
     echo "devin-task: Devin refused an action in '$PERM' mode and stopped. $hint Partial edits may already be on disk; check git status." >&2
     RC=3
+  elif [ "$RC" -ne 0 ]; then
+    classify_failure "$WORK/stderr" "${so:-$WORK/stdout}"
   fi
 }
 
@@ -192,6 +225,16 @@ while :; do
   rm -f "$EXPORT"
   run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
   [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
+  RETRY_I=0
+  while [ $RC -eq 6 ] && [ "$RETRY_I" -lt "$RETRIES" ]; do
+    RETRY_I=$((RETRY_I+1))
+    SLEEP_S=$((RETRY_BASE * RETRY_I))
+    echo "devin-task: retrying transient failure (attempt $RETRY_I/$RETRIES) in ${SLEEP_S}s" >&2
+    sleep "$SLEEP_S"
+    rm -f "$EXPORT"
+    run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
+    [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
+  done
   [ $RC -ne 0 ] && break
   [ -z "$UNTIL" ] && break
   CHECK_OUT="$(bash -c "$UNTIL" 2>&1)"; CHECK_RC=$?
