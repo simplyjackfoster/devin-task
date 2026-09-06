@@ -217,3 +217,55 @@ install.sh            symlinks into ~/.claude/skills and ~/.local/bin
 ```
 
 MIT.
+
+## Experimental: ACP transport
+
+`scripts/devin-task-acp` is a spike, not part of the skill. It drives `devin
+acp` — the Agent Client Protocol server, JSON-RPC 2.0 over stdio — instead of
+print mode, in Python 3 with nothing but the standard library:
+
+```bash
+scripts/devin-task-acp --trace "summarise README.md in one line"
+scripts/devin-task-acp --json --approve none "what would you run for X?"
+```
+
+Two things ACP buys over print mode: tool calls arrive as they happen, so
+`--trace` streams them live, and every shell command comes back as a
+`session/request_permission` request that this script answers itself, so the
+permission policy lives here instead of in a generated Devin config.
+
+`--approve` picks that policy:
+
+- `read` (default) allows a command when **every** `&&` / `||` / `;` / `|`
+  segment starts with one of cat head tail sed grep rg wc ls stat file diff
+  jq cut tr uniq pwd which, or `git` with log/status/diff/show.
+- `all` allows everything, `none` cancels everything (a dry run of what Devin
+  would reach for).
+
+Anything cancelled is printed to stderr as `denied: <command>`. A denial does
+not end the run: Devin continues, says the command was rejected, and still
+finishes with `end_turn`.
+
+Other flags mirror the wrapper: `--model`, `--timeout`, `--cwd`,
+`--prompt-file`, `--json`, `--trace`, positional or stdin prompt.
+`--answer-only` is accepted for parity but is a no-op — stdout here is only
+the agent's message. Exit codes: 0 ok, 2 usage, 3 something was denied and the
+answer came back empty, 124 timeout, 143 signalled, 1 JSON-RPC error.
+
+Not covered yet: no `--edit` equivalent, no `--until` loop, no session resume,
+no `--allow` for extra rules. The policy is a word match, not a shell parser,
+so `cat x > y` slips through where the bash wrapper's Devin-native allowlist
+refuses redirections, and `cd sub && cat f` is denied because `cd` is not on
+the list. Operators inside quotes are not understood either, so
+`grep -E "a|b" f` is denied under `read`; a `shlex(punctuation_chars=True)`
+tokeniser would fix that and redirections both, and is the obvious follow-up.
+The per-segment check exists because on a live run Devin folded two requested
+commands into a single chained one; matching only the first word allowed the
+whole chain.
+
+```bash
+bash tests/test_devin_task_acp.sh
+```
+
+Thirty-seven checks against a stub `devin` that speaks enough of the protocol.
+No live call in there; the spike's live check is run by hand.
