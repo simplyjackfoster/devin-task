@@ -59,20 +59,47 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--preamble T` | prepend standing instructions; also `DEVIN_TASK_PREAMBLE` |
 | `--inherit-env` | prepend the caller's `python3`, `node` and `CONDA_PREFIX` so Devin uses them |
 | `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
-| `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
-| `--retries N` | retry capacity/rate-limit failures (exit 6) only, default 1; sleeps `5 × attempt` seconds between attempts, overridable via `DEVIN_TASK_RETRY_BASE` |
+| `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted. Ignored when `--progress` is given |
+| `--progress CMD` | after each `--until` pass run `bash -c CMD`; it must print one integer. A pass that does not raise it is a stall, and while the number rises the run is unbounded — `--progress` replaces pass counting |
+| `--max-stalls N` | consecutive stalls that end a `--progress` run, default 5; exit 5 |
+| `--retries N` | retry connection/capacity/rate-limit failures (exit 6) only, default 1; sleeps `backoff × attempt` seconds between attempts |
+| `--backoff S` | retry backoff base in seconds, default 30; also `DEVIN_TASK_RETRY_BASE`, which the flag overrides |
+| `--max-concurrent N` | run at most N devin passes at once across every `devin-task` on the machine (default: unlimited). Waits for a free slot; see [Concurrency](#concurrency) |
+| `--slot-timeout S` | how long to wait for a slot, default 600; exit 6 on expiry, so `--retries` applies |
 | `--no-empty-retry` | don't nudge-resume an empty turn (below) once; detection still runs and still exits 9 |
 | `--answer-only` | print only Devin's final message |
 | `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is; `passes` counts only `--until` passes — a nudge pass (below) is never counted |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
+| `--summary` | one line on stderr at exit: `devin-task: 137s elapsed, 24 tool calls, exit 0`. Off unless the flag or `DEVIN_TASK_SUMMARY=1` is given, so existing callers' stderr is unchanged. For logging per-pass cost from a batch driver without parsing `--json` |
 
-Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
-6 capacity or rate limit (retryable), 7 upstream internal error,
+Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted
+(`--max-passes`, or `--max-stalls` under `--progress`),
+6 connection error, capacity, rate limit or no free concurrency slot
+(retryable), 7 upstream internal error,
 8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout,
 143 the wrapper was killed by SIGTERM or SIGINT.
 
-`--retries`, `--timeout` and `--max-passes` (and `DEVIN_TASK_RETRY_BASE`) are
-checked before the first pass; a non-integer value is a usage error (exit 2).
+`--retries`, `--backoff`, `--timeout`, `--max-passes`, `--max-concurrent`,
+`--slot-timeout` and `--max-stalls` (and `DEVIN_TASK_RETRY_BASE`) are checked
+before the first pass; a non-integer value is a usage error (exit 2).
+`--backoff` is validated after it overrides `DEVIN_TASK_RETRY_BASE`, so a bad
+env value with a good flag is fine.
+
+### Observed throughput
+
+One user's measurement on `swe-1-7-medium`, 2026-09-06. Not a guarantee: one
+account on the free tier, one task shape (labelling JSONL rows), and Devin's
+capacity varies by the hour.
+
+| Setup | Throughput | Notes |
+|---|---|---|
+| 1 session | ~100 rows / 8 min | steady, no throttling |
+| 5 concurrent | ~60 rows / 5–8 min **each** | ran clean for an hour |
+| 8 concurrent | — | hard drop-off: throttled on about a third of passes |
+
+`--max-concurrent 5 --backoff 60` were the settings that ran clean. Five is the
+ceiling worth planning around; eight buys nothing, because the retries the
+throttling forces cost more than the extra sessions add.
 
 ### Classifying upstream failures, and `--retries`
 
@@ -80,23 +107,28 @@ When a pass exits non-zero, the wrapper scans Devin's stderr (and captured
 stdout) for known upstream failure text, checked in this order so a
 transient error is never misread as a dead login:
 
-1. **capacity** (exit 6) — `high demand`, `try again later`, `currently
+1. **connection error** (exit 6) — `connection error`, the CLI's
+   "Connection error, send a message to continue retrying"
+2. **capacity** (exit 6) — `high demand`, `try again later`, `currently
    busy/overloaded/at capacity`, `server is busy`, `overloaded`, `capacity`
-2. **internal error** (exit 7) — `internal error occurred` / `internal
+3. **internal error** (exit 7) — `internal error occurred` / `internal
    error`. Devin sometimes wraps this inside a 401/403-looking message, so
    it is matched before the auth patterns below.
-3. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
+4. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
    `unauthorized`, `invalid ... api key/token`, `authentication failed`
-4. **rate limit** (exit 6) — `rate limit`, `too many requests`,
-   `resource_exhausted`
+5. **rate limit** (exit 6) — `rate limit`, `too many requests`,
+   `resource_exhausted` (Devin surfaces the last of these as
+   `cognition.ai/errorKind: resource_exhausted`)
 
 The existing refusal detection (a rejected tool call → exit 3) keeps
-precedence over all of these. Only exit-6 conditions (capacity, rate limit)
-are retried, up to `--retries N` times (default 1), sleeping `5 × attempt`
-seconds between attempts (5s, then 10s, ...) before re-running the same
-pass — a fresh pass, not a session resume, though a pass already resumed
-under `--until` stays resumed. Set `DEVIN_TASK_RETRY_BASE` to change the
-5-second base (tests use `0`).
+precedence over all of these. Only exit-6 conditions (connection error,
+capacity, rate limit) are retried, up to `--retries N` times (default 1),
+sleeping `backoff × attempt` seconds between attempts (30s, then 60s, ...)
+before re-running the same pass — a fresh pass, not a session resume, though a
+pass already resumed under `--until` stays resumed. `--backoff SECS` sets the
+base, defaulting to 30; `DEVIN_TASK_RETRY_BASE` does the same and the flag wins
+(tests use `--backoff 0`). The default was raised from 5 to 30 because the rate
+limits observed at concurrency needed roughly 60 seconds to clear.
 
 ### Empty turns and `--no-empty-retry`
 
@@ -156,6 +188,51 @@ in one directory do not collide) with the check's exit code and last 40 lines
 of output. Write checks that print what is missing. Run loops in the
 background from Claude Code: the Bash tool caps a call at 600s.
 
+### Checkpoint the output
+
+For any task producing many rows or files, tell Devin in the prompt to append
+its output every 20 rows or so and to write append-only, never rewriting the
+file — a pass that hits the 600-second timeout otherwise leaves nothing behind.
+The rule and an example prompt fragment are in
+[SKILL.md](SKILL.md#writing-the-prompt), and
+[`examples/batch/`](examples/batch/) is a complete loop built on it —
+`check.sh` for `--until` and `--progress`, `run.sh` for the chunked prompt,
+`dedupe.sh` for the duplicates a retry leaves behind.
+
+### Progress-based stopping: `--progress` and `--max-stalls`
+
+`--max-passes` is the wrong bound for a job whose size you do not know up
+front. `--progress CMD` measures the work instead: after each `--until` pass
+the wrapper runs `bash -c CMD` in the working directory and reads a single
+integer from its stdout — rows written, files converted, whatever the caller
+counts.
+
+```bash
+devin-task --yolo --max-concurrent 5 --backoff 60 --retries 3 \
+  --until 'test -z "$(./check.sh --missing)"' \
+  --progress './check.sh --count' --prompt-file chunk.md
+```
+
+- A pass whose number is higher than the previous reading resets the stall
+  counter. **While progress continues the run is not bounded** —
+  `--progress` replaces pass counting, and `--max-passes` is ignored. It still
+  applies when `--progress` is absent.
+- A pass whose number did not rise is a **stall**. `--max-stalls N`
+  consecutive stalls (default 5) end the run with exit **5** — the same code as
+  an exhausted `--max-passes` — and a stderr line naming the stall count and
+  the last value.
+- `--until` still decides success. `--progress` only decides when to give up.
+- The reading and the change since the last pass go into the resume prompt
+  next to the check output, so Devin sees both what is missing and whether the
+  previous pass moved the needle.
+
+The command is run once **before pass 1** to establish a baseline, so pass 1's
+own gain is measured; a job resumed with rows already done that produces none
+is correctly a stall. A command that fails or prints a non-integer at that
+baseline is a usage error (exit **2**, before any Devin call). From pass 1 on,
+the same result counts as a stall instead — a check that breaks halfway through
+a long run should not be a crash. `--progress` has no effect without `--until`.
+
 ### Environment mismatch
 
 Devin runs commands in a login shell, which can order PATH differently from
@@ -171,8 +248,35 @@ Devin's whole process tree, so a killed call leaves nothing behind.
 
 ### Concurrency
 
-Three concurrent runs in one directory worked with no interference. No rate
-limit was observed on the free models and none is documented.
+Concurrent runs in one directory do not interfere: each has its own session,
+temp prompt and export, and `--until` resumes by session id. The limit is
+upstream, not local. On the free tier **five concurrent sessions is the
+observed safe ceiling**: eight concurrent sessions were throttled on about a
+third of passes, while five with `--backoff 60` ran clean for an hour.
+
+`--max-concurrent N` enforces that ceiling for you. It is a machine-wide limit,
+shared by every `devin-task` process, not a per-invocation one — start twenty
+runs with `--max-concurrent 5` and only five talk to Devin at a time:
+
+```bash
+devin-task --yolo --max-concurrent 5 --backoff 60 --retries 3 \
+  --until './check.sh' --prompt-file chunk.md
+```
+
+A slot is a directory under `${TMPDIR:-/tmp}/devin-task-slots`
+(`DEVIN_TASK_SLOT_DIR` overrides it) holding the owning wrapper's pid. `mkdir`
+is the atomic primitive — macOS has no `flock` — so `slot-1`..`slot-N` are
+claimed race-free. A slot is acquired before each Devin pass and released on
+every exit path, including a `--timeout` kill and SIGTERM/SIGINT. A slot whose
+pid is no longer alive (a `kill -9`, a reboot) is reclaimed as stale; the
+reclaim goes through `mv` first, so when two waiters spot the same dead pid
+only one can win and the loser cannot delete the winner's new slot.
+
+If no slot is free the wrapper polls every 2 seconds up to `--slot-timeout
+SECS` (default 600) and then exits **6** with a stderr line — the same
+retryable class as a rate limit, so `--retries` re-attempts the acquisition.
+Without `--max-concurrent` the slot directory is never touched. `--trace`
+prints one line when the wait starts and one when the slot is acquired.
 
 ## Why a wrapper at all
 
@@ -200,18 +304,32 @@ Verified against Devin CLI 3000.6.14 on macOS:
 
 ```bash
 bash tests/test_devin_task.sh
+bash tests/test_examples_batch.sh
 ```
 
-Seventy-seven checks against a stub `devin` on PATH (argv, generated config and
+A hundred and twenty-two checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
-timeout, signal propagation, failure classification, `--retries`, integer
-validation of the numeric flags, the `--until` loop, empty-turn detection and
+timeout, signal propagation, failure classification, `--retries` and
+`--backoff`, integer validation of the numeric flags, the `--max-concurrent`
+slot limiter (non-overlap of two concurrent runs, stale-slot reclaim, slot
+timeout, and slot release after a `--timeout` kill and after SIGTERM), the
+`--until` loop, `--progress`/`--max-stalls` (an unbounded productive run, five
+zero-gain passes, a gain resetting the counter, and a non-integer reading),
+a timeout that produced no output at all (plain, `--json` and `--answer-only`),
+three concurrent runs overlapping under `--max-concurrent 3` and the third
+being gated under `--max-concurrent 2`, `--summary` and its default silence, empty-turn detection and
 `--no-empty-retry`, including a cumulative-export case where a later `--until`
 pass adds only empty steps, a non-object export, and a capacity failure
 retried during the nudge) plus two live calls on the free model. Set
 `DEVIN_TASK_TEST_NO_LIVE=1` to skip the two live calls (prints `live: skipped`
 instead). CI runs this suite with that var set, and the ACP suite, which makes
 no live calls, as it is, on every push and pull request.
+
+`tests/test_examples_batch.sh` adds sixteen checks that drive
+`examples/batch/run.sh` through the wrapper against a stub `devin` which
+appends a few of the still-missing rows per call and re-appends one every
+other call, then asserts every id landed and `dedupe.sh` collapses the
+duplicates. No live calls; CI runs it too.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file
@@ -223,7 +341,8 @@ loop ends.
 ```
 SKILL.md              Claude Code skill: when and how Claude should delegate
 scripts/devin-task    the wrapper (bash, no dependencies beyond devin)
-tests/                stub-based test suite
+examples/batch/       a worked chunked-batch loop: check.sh, run.sh, dedupe.sh
+tests/                stub-based test suites
 install.sh            symlinks into ~/.claude/skills and ~/.local/bin
 ```
 

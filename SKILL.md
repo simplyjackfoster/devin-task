@@ -19,8 +19,12 @@ devin-task --json "prompt"                            # {answer, session_id, exi
 devin-task --yolo --until 'python3 check.py' --max-passes 12 "prompt"   # loop until check exits 0
 devin-task --inherit-env --yolo "prompt"              # tell Devin which python3/node to use
 devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
-devin-task --retries 2 "prompt"                       # retry capacity/rate-limit failures (exit 6)
+devin-task --retries 2 "prompt"                       # retry connection/capacity/rate-limit failures (exit 6)
+devin-task --retries 3 --backoff 60 "prompt"          # 60s x attempt between retries (default 30)
+devin-task --max-concurrent 5 "prompt"                # machine-wide cap on simultaneous devin passes
+devin-task --until 'CHK' --progress 'COUNT' "prompt"  # stop on stalled progress, not on a pass count
 devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
+devin-task --summary "prompt"                         # stderr: elapsed, tool-call count, exit code
 ```
 
 From the Bash tool pass `timeout: 600000` or use `run_in_background: true`;
@@ -63,6 +67,22 @@ and use `--prompt-file`; the wrapper never passes prompts through the shell.
 Devin's plain stdout concatenates its progress messages without newlines, so
 for anything parsed use `--answer-only` or `--json`.
 
+**Checkpoint the output.** For any task that produces many rows or files, tell
+Devin in the prompt to append its output early and often — every 20 rows or so
+— and to write append-only, never rewriting the output file. A pass that hits
+the 600-second `--timeout` otherwise leaves nothing at all behind, because
+Devin was still holding the whole result to write at the end. Across a
+300-pass run, killed and timed-out passes with append-only output never lost or
+corrupted a row; the cost is duplicate ids after a retry, which a dedupe pass
+collapses. Two lines in the prompt do it:
+
+> Append each result to `out.jsonl` as you finish it, at least every 20 rows.
+> Only ever append to that file — never rewrite it, never rewrite earlier lines.
+
+`examples/batch/` is a complete loop built this way: `check.sh` (the
+`--until` check and the `--progress` counter), `run.sh` (chunked prompts) and
+`dedupe.sh` (collapse the duplicate ids a retry leaves behind).
+
 ## Resumable tasks with --until
 
 `--until CMD` runs `bash -c CMD` in the working directory after each pass.
@@ -71,21 +91,47 @@ with the check's exit code and last 40 lines of output, so Devin sees exactly
 what is still missing. `--max-passes` (default 5) exhausted gives exit 5.
 Write the check to print what is missing, not just fail.
 
+For a job whose size you do not know up front, bound it by progress instead of
+by pass count. `--progress CMD` runs `bash -c CMD` after each pass; it must
+print a single integer (rows done, files written). A pass that raises it resets
+the stall counter and the run keeps going — `--progress` replaces
+`--max-passes`, which is then ignored. `--max-stalls N` consecutive passes
+without a gain (default 5) end the run with exit 5, naming the stall count and
+last value. `--until` still decides success. The value and the change since the
+last pass go into the resume prompt next to the check output. The command is
+baselined once before pass 1; a failing or non-integer reading there is exit 2,
+but the same thing later is just a stall.
+
 ## Concurrency
 
-Three concurrent `devin-task` runs in one directory worked with no
-interference. No rate limit was observed; none is documented for the free
-models. Each run has its own session, temp prompt and export.
+Concurrent runs in one directory do not interfere — each has its own session,
+temp prompt and export. The limit is upstream. On the free tier **five
+concurrent sessions is the observed safe ceiling**: eight were throttled on
+about a third of passes, five with `--backoff 60` ran clean for an hour.
+
+`--max-concurrent N` enforces it machine-wide (a lock directory under
+`${TMPDIR:-/tmp}/devin-task-slots`, `DEVIN_TASK_SLOT_DIR` to move it), so you
+can fire off twenty background runs and only N talk to Devin at once. A slot is
+taken before each pass and released on every exit path, including a `--timeout`
+kill and SIGTERM; a slot whose owner died is reclaimed. Waiting longer than
+`--slot-timeout SECS` (default 600) exits 6, which `--retries` re-attempts.
+For a batch job the settings that ran clean were
+`--max-concurrent 5 --backoff 60 --retries 3`.
 
 ## Failure modes
 
 - Exit 3: refused action. The message names the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
-- Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
-- Exit 6: upstream capacity or rate-limit error (retryable). The wrapper already
-  retries these itself up to `--retries N` times (default 1), sleeping `5 ×
-  attempt` seconds between attempts, before giving up with exit 6. Retry the
-  whole `devin-task` call again, or raise `--retries`.
+- Exit 5: `--until` check still failing after `--max-passes`, or `--max-stalls`
+  consecutive passes with no `--progress` gain. Its last output is on stderr.
+- Exit 6: upstream connection error, capacity or rate-limit error, or no free
+  `--max-concurrent` slot within `--slot-timeout` (all retryable).
+  Devin's own "Connection error, send a message to continue retrying" counts.
+  The wrapper already retries these itself up to `--retries N` times
+  (default 1), sleeping `backoff × attempt` seconds between attempts — the base
+  is `--backoff SECS` (default 30, or `DEVIN_TASK_RETRY_BASE`; the flag wins) —
+  before giving up with exit 6. Retry the whole `devin-task` call again, or
+  raise `--retries`.
 - Exit 7: upstream internal error. Not retried automatically; re-run if it looks transient.
 - Exit 8: authentication failure (bad/expired credentials). Run `devin auth status`;
   a refused action (exit 3) is not this — internal-error text inside a
@@ -100,8 +146,13 @@ models. Each run has its own session, temp prompt and export.
   other pass, and does consume the retry budget.
 - Exit 143: the wrapper itself was killed by SIGTERM or SIGINT. It kills
   Devin's process tree on the way out, so nothing is left running.
-- Exit 2 also covers a non-integer `--retries`, `--timeout`, `--max-passes` or
+- Exit 2 also covers a non-integer `--retries`, `--backoff`, `--timeout`,
+  `--max-passes`, `--max-concurrent`, `--slot-timeout`, `--max-stalls` or
   `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
+- `--summary` (or `DEVIN_TASK_SUMMARY=1`) adds one stderr line at exit —
+  `devin-task: 137s elapsed, 24 tool calls, exit 0` — on every exit path once a
+  run has started. Off by default so existing callers' stderr is unchanged. Use
+  it to log per-pass cost from a loop without parsing `--json`.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -114,4 +165,4 @@ models. Each run has its own session, temp prompt and export.
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (77 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (122 stub-devin checks plus two live calls).
