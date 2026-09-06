@@ -277,13 +277,17 @@ echo "the nudge pass is retried like any other pass (--retries)"
 reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --retries 1 "do the task" 2>&1)"; rc=$?
 [ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "a capacity failure during the nudge is retried like the main pass (3 calls, exit 0)" || fail "nudge retried" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
 
-echo "live (real devin, free model)"
-PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG
-out="$(cd "$TMP" && "$WRAPPER" --timeout 60 "Reply with exactly the word PONG and nothing else." 2>&1)"; rc=$?
-[ $rc -eq 0 ] && echo "$out" | grep -q PONG && ok "real devin round-trip" || fail "live" "rc=$rc out=$out"
-printf 'a\nb\nc\n' > "$TMP/f.txt"
-out="$(cd "$TMP" && "$WRAPPER" --answer-only --timeout 90 "Run exactly: head -2 f.txt   then reply with only the output, nothing else." 2>&1)"; rc=$?
-[ $rc -eq 0 ] && echo "$out" | grep -q "^b" && ok "live read-only head via allowlist, answer-only" || fail "live allowlist" "rc=$rc out=$out"
+if [ "${DEVIN_TASK_TEST_NO_LIVE:-0}" = "1" ]; then
+  echo "live: skipped"
+else
+  echo "live (real devin, free model)"
+  PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG
+  out="$(cd "$TMP" && "$WRAPPER" --timeout 60 "Reply with exactly the word PONG and nothing else." 2>&1)"; rc=$?
+  [ $rc -eq 0 ] && echo "$out" | grep -q PONG && ok "real devin round-trip" || fail "live" "rc=$rc out=$out"
+  printf 'a\nb\nc\n' > "$TMP/f.txt"
+  out="$(cd "$TMP" && "$WRAPPER" --answer-only --timeout 90 "Run exactly: head -2 f.txt   then reply with only the output, nothing else." 2>&1)"; rc=$?
+  [ $rc -eq 0 ] && echo "$out" | grep -q "^b" && ok "live read-only head via allowlist, answer-only" || fail "live allowlist" "rc=$rc out=$out"
+fi
 
 echo; echo "passed=$PASS failed=$FAIL"
 [ $FAIL -eq 0 ]

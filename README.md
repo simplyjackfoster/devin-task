@@ -202,7 +202,10 @@ timeout, signal propagation, failure classification, `--retries`, the
 `--until` loop, empty-turn detection and `--no-empty-retry`, including a
 cumulative-export case where a later `--until` pass adds only empty steps,
 a non-object export, and a capacity failure retried during the nudge)
-plus two live calls on the free model.
+plus two live calls on the free model. Set `DEVIN_TASK_TEST_NO_LIVE=1` to skip
+the two live calls (prints `live: skipped` instead); CI runs both this suite
+and `tests/test_devin_task_acp.sh` with that var set on every push and pull
+request.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file

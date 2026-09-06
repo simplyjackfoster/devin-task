@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # scripts/devin-task shells out to python3 at runtime (for generating
+      # its allowlist config and parsing --json/--trace output); ubuntu-latest
+      # runner images ship python3 by default, so no extra setup step is needed.
+      - name: Syntax check
+        run: |
+          bash -n scripts/devin-task
+          bash -n install.sh
+          bash -n tests/test_devin_task.sh
+          bash -n tests/test_devin_task_acp.sh
+          python3 -m py_compile scripts/devin-task-acp
+
+      - name: Run devin-task test suite (no live calls)
+        run: DEVIN_TASK_TEST_NO_LIVE=1 bash tests/test_devin_task.sh
+
+      - name: Run devin-task-acp test suite
+        run: bash tests/test_devin_task_acp.sh
