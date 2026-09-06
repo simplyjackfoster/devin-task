@@ -100,6 +100,8 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 [ "$(cat "$STUB_PROMPT")" = "from file" ] && ok "--prompt-file wins over positional" || fail "--prompt-file" "$(cat "$STUB_PROMPT")"
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
+out="$("$WRAPPER" --help 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q "124" && ok "--help prints the full header, including --retries and exit code 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1

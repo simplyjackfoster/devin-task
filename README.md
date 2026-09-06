@@ -168,7 +168,7 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Fifty-five checks against a stub `devin` on PATH (argv, generated config and
+Fifty-eight checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries`, the
 `--until` loop) plus two live calls on the
