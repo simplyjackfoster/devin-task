@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# devin-task: run a one-shot task through the local Devin CLI on the free SWE-1.7 model.
+#
+# Usage:
+#   devin-task [--edit | --yolo] [--model M] [--timeout SECS] "prompt"
+#   echo "long prompt" | devin-task [flags]
+#
+# Default is read-only (Devin may read files and run read-only commands).
+#   --edit     also allow file edits in the workspace   (accept-edits)
+#   --yolo     auto-approve everything, incl. commands  (dangerous)
+#   --model M  override model (default swe-1-7-medium, free)
+#   --timeout  seconds before the run is killed (default 600)
+set -u
+
+MODEL="swe-1-7-medium"
+PERM="auto"
+TIMEOUT=600
+PROMPT=""
+
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --edit)    PERM="accept-edits"; shift ;;
+    --yolo)    PERM="dangerous"; shift ;;
+    --model)   MODEL="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    --)        shift; PROMPT="$*"; break ;;
+    -*)        echo "devin-task: unknown flag $1" >&2; usage ;;
+    *)         PROMPT="$*"; break ;;
+  esac
+done
+
+if [ -z "$PROMPT" ] && [ ! -t 0 ]; then
+  PROMPT="$(cat)"
+fi
+[ -z "$PROMPT" ] && usage
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+printf '%s' "$PROMPT" > "$WORK/prompt.md"
+ERR="$WORK/stderr"
+
+devin --model "$MODEL" \
+      --permission-mode "$PERM" \
+      --respect-workspace-trust false \
+      --prompt-file "$WORK/prompt.md" \
+      -p 2>"$ERR" &
+PID=$!
+trap 'kill "$PID" 2>/dev/null; rm -rf "$WORK"; exit 143' TERM INT
+
+waited=0
+while kill -0 "$PID" 2>/dev/null; do
+  if [ "$waited" -ge "$TIMEOUT" ]; then
+    kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
+    echo "devin-task: timed out after ${TIMEOUT}s" >&2
+    exit 124
+  fi
+  sleep 1; waited=$((waited+1))
+done
+wait "$PID"; RC=$?
+
+[ -s "$ERR" ] && cat "$ERR" >&2
+
+if grep -q "rejected a tool call that requires confirmation" "$ERR"; then
+  case "$PERM" in
+    auto)         HINT="Re-run with --edit (file edits) or --yolo (also runs commands such as python3/pytest)." ;;
+    accept-edits) HINT="Re-run with --yolo: edit mode allows file writes but not running commands such as python3/pytest." ;;
+    *)            HINT="Refused even in '$PERM' mode; read the stderr above." ;;
+  esac
+  echo "devin-task: Devin refused an action in '$PERM' mode and stopped. $HINT Partial edits may already be on disk; check git status." >&2
+  exit 3
+fi
+exit "$RC"
