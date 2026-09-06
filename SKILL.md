@@ -19,6 +19,8 @@ devin-task --json "prompt"                            # {answer, session_id, exi
 devin-task --yolo --until 'python3 check.py' --max-passes 12 "prompt"   # loop until check exits 0
 devin-task --inherit-env --yolo "prompt"              # tell Devin which python3/node to use
 devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
+devin-task --retries 2 "prompt"                       # retry capacity/rate-limit failures (exit 6)
+devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
 ```
 
 From the Bash tool pass `timeout: 600000` or use `run_in_background: true`;
@@ -36,6 +38,7 @@ and partial edits may already be on disk.
 |---|---|
 | default | use file tools, and run the read-only shell allowlist: `cat head tail sed -n grep rg wc ls stat file diff jq cut tr uniq pwd which git log/status/diff/show` (pipes allowed; `>` redirection and `sed -i` are refused) |
 | `--edit` | also write files. Still no commands beyond the allowlist. |
+| `--smart` | Devin's `--permission-mode smart`: additionally auto-runs actions a fast model judges safe, per Devin's help text. Still gets the read-only allowlist. On this account Devin reports it "not available" and falls back to normal; whether the judging model bills anything when it does become available is unverified. |
 | `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote. |
 
 `--allow 'Exec(<prefix>)'` (repeatable) extends the allowlist in any mode,
@@ -79,7 +82,26 @@ models. Each run has its own session, temp prompt and export.
 - Exit 3: refused action. The message names the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
 - Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
-- Empty stdout with exit 0 should not happen; check stderr.
+- Exit 6: upstream capacity or rate-limit error (retryable). The wrapper already
+  retries these itself up to `--retries N` times (default 1), sleeping `5 ×
+  attempt` seconds between attempts, before giving up with exit 6. Retry the
+  whole `devin-task` call again, or raise `--retries`.
+- Exit 7: upstream internal error. Not retried automatically; re-run if it looks transient.
+- Exit 8: authentication failure (bad/expired credentials). Run `devin auth status`;
+  a refused action (exit 3) is not this — internal-error text inside a
+  401/403-looking message is classified as exit 7, not 8.
+- Exit 9: empty turn persisted after a nudge. On `swe-1-7*` models a pass can
+  exit 0 with no agent message and no tool call (a known upstream failure).
+  The wrapper resumes the session once with a fixed nudge prompt; if still
+  empty, it exits 9. `--no-empty-retry` skips the resume and exits 9 right
+  away. A nudge pass never counts against `--max-passes` or `--json`'s
+  `passes`, and an empty turn is not itself retried by `--retries`. A capacity
+  or rate-limit failure during the nudge is retried under `--retries` like any
+  other pass, and does consume the retry budget.
+- Exit 143: the wrapper itself was killed by SIGTERM or SIGINT. It kills
+  Devin's process tree on the way out, so nothing is left running.
+- Exit 2 also covers a non-integer `--retries`, `--timeout`, `--max-passes` or
+  `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -88,6 +110,8 @@ models. Each run has its own session, temp prompt and export.
 ## Cost
 
 `swe-1-7-medium`, `swe-1-7` and `glm-5-2` are free on this account. Any other
-`--model` bills Devin credits; `devin models list` shows prices.
+`--model` bills Devin credits; `devin models list` shows prices. Which models
+are free may be plan-specific, so `devin models list` is the source of truth
+for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (stub devin plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (77 stub-devin checks plus two live calls).

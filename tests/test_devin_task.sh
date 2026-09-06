@@ -28,9 +28,87 @@ done
 case "${STUB_MODE:-ok}" in
   ok)
     echo "narrative line"; echo "STUB-OK"
-    [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\",\"tool_calls\":[{\"function_name\":\"exec\",\"arguments\":{\"command\":\"wc -l f.txt\"}}]},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{\"total_steps\":3}}" > "$EXPORT" ;;
+    if [ -n "$EXPORT" ]; then
+      # cumulative like a real resumed-session export: on call n the first two
+      # steps stay fixed and n copies of the final-message step are appended,
+      # so a multi-call --until run genuinely grows the export each pass.
+      final="{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}"
+      steps="{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\",\"tool_calls\":[{\"function_name\":\"exec\",\"arguments\":{\"command\":\"wc -l f.txt\"}}]}"
+      i=1; while [ "$i" -le "$n" ]; do steps="$steps,$final"; i=$((i+1)); done
+      printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[$steps],\"final_metrics\":{\"total_steps\":$((2+n))}}" > "$EXPORT"
+    fi
+    ;;
   reject) echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2; exit 0 ;;
   hang)   sleep 30; echo "never" ;;
+  capacity)  echo "Error: the servers are currently overloaded, please try again later" >&2; exit 1 ;;
+  internal)  echo "Error: internal error occurred (trace ID: abcd1234)" >&2; exit 1 ;;
+  auth)      echo "Error: request unauthorized: invalid api key" >&2; exit 1 ;;
+  ratelimit) echo "Error: too many requests, rate limit exceeded" >&2; exit 1 ;;
+  internal_in_auth) echo "Error: unauthorized - internal error occurred (trace ID: zz99)" >&2; exit 1 ;;
+  capacity_then_ok)
+    if [ "$n" -lt 3 ]; then
+      echo "Error: currently overloaded, try again later" >&2; exit 1
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
+  empty)
+    echo "narrative line"
+    if [ -n "$EXPORT" ]; then
+      if [ "$n" -lt 2 ]; then
+        printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+      else
+        printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+      fi
+    fi
+    ;;
+  empty_then_ok)
+    if [ "$n" -lt 2 ]; then
+      echo "narrative line"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
+  until_empty_pass2)
+    # cumulative export across a 3-call --until run: call 1 is a normal
+    # pass with a real message; call 2 (the --until resume) appends only an
+    # empty step (no message, no tool_calls) on top of call 1's content;
+    # call 3 (the nudge resume) appends a real final message.
+    if [ "$n" -eq 1 ]; then
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"}],\"final_metrics\":{}}" > "$EXPORT"
+    elif [ "$n" -eq 2 ]; then
+      echo "narrative line"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"},{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"},{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
+  list_export)
+    # a syntactically valid export that is not an object (a top-level JSON
+    # list): must not crash is_empty_turn/step_count with a traceback.
+    echo "narrative line"; echo "STUB-OK"
+    [ -n "$EXPORT" ] && printf '%s' '[1,2,3]' > "$EXPORT"
+    ;;
+  empty_then_capacity_then_ok)
+    # call 1 is empty (triggers the nudge); call 2 (the nudge's first
+    # attempt) fails with capacity text; call 3 (the nudge's retry, via
+    # --retries) succeeds. Proves a transient failure during the nudge is
+    # retried the same way a transient failure in the main pass is.
+    if [ "$n" -eq 1 ]; then
+      echo "narrative line"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    elif [ "$n" -eq 2 ]; then
+      echo "Error: currently overloaded, try again later" >&2; exit 1
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
 esac
 STUB
 chmod +x "$TMP/bin/devin"
@@ -60,6 +138,8 @@ allow_has "Fetch(domain:*)" && ok "user's existing allow rules preserved" || fai
 python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["agent"]["model"]=="swe-1-7-medium" else 1)' "$STUB_CONFIG" && ok "rest of user config preserved" || fail "user config clobbered"
 reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
 [ -f "$STUB_CONFIG" ] && allow_has "Exec(head)" && ok "--edit also gets the allowlist" || fail "edit allowlist"
+reset; "$WRAPPER" --smart "x" >/dev/null 2>&1
+[ -f "$STUB_CONFIG" ] && allow_has "Exec(head)" && ok "--smart also gets the allowlist" || fail "smart allowlist"
 reset; "$WRAPPER" --yolo "x" >/dev/null 2>&1
 [ ! -f "$STUB_CONFIG" ] && ok "--yolo passes no --config" || fail "yolo config"
 reset; "$WRAPPER" --allow 'Exec(python3 -c)' --allow 'Exec(make test)' "x" >/dev/null 2>&1
@@ -68,6 +148,8 @@ allow_has "Exec(python3 -c)" && allow_has "Exec(make test)" && ok "--allow (repe
 echo "flags"
 reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
 argv_pair "--permission-mode accept-edits" && ok "--edit -> accept-edits" || fail "--edit"
+reset; "$WRAPPER" --smart "x" >/dev/null 2>&1
+argv_pair "--permission-mode smart" && [ -f "$STUB_CONFIG" ] && ok "--smart -> permission-mode smart, with a --config" || fail "--smart"
 reset; "$WRAPPER" --yolo "x" >/dev/null 2>&1
 argv_pair "--permission-mode dangerous" && ok "--yolo -> dangerous" || fail "--yolo"
 reset; "$WRAPPER" --model swe-1-7 "x" >/dev/null 2>&1
@@ -87,6 +169,8 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 [ "$(cat "$STUB_PROMPT")" = "from file" ] && ok "--prompt-file wins over positional" || fail "--prompt-file" "$(cat "$STUB_PROMPT")"
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
+out="$("$WRAPPER" --help 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
@@ -119,6 +203,41 @@ STUB_MODE=hang "$WRAPPER" --timeout 30 "slow" >/dev/null 2>&1 &
 wpid=$!; sleep 1; kill -TERM "$wpid"; sleep 2
 if pgrep -f "$TMP/bin/devin" >/dev/null; then fail "SIGTERM to wrapper kills devin child"; pkill -f "$TMP/bin/devin"; else ok "SIGTERM to wrapper kills devin child"; fi
 
+echo "failure classification"
+reset; out="$(STUB_MODE=capacity "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && echo "$out" | grep -qi "capacity" && ok "capacity text -> exit 6" || fail "capacity classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=internal "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 7 ] && echo "$out" | grep -qi "internal" && ok "internal error text -> exit 7" || fail "internal classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=auth "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 8 ] && echo "$out" | grep -qi "auth" && ok "auth text -> exit 8" || fail "auth classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=ratelimit "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && echo "$out" | grep -qi "rate limit" && ok "rate limit text -> exit 6" || fail "ratelimit classification" "rc=$rc $out"
+reset; out="$(STUB_MODE=internal_in_auth "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 7 ] && ok "internal-inside-auth text -> exit 7, not 8 (transient-first ordering)" || fail "internal-in-auth ordering" "rc=$rc $out"
+reset; out="$(STUB_MODE=reject "$WRAPPER" "x" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ok "refusal detection keeps precedence over classification -> exit 3" || fail "refusal precedence" "rc=$rc $out"
+
+echo "--retries"
+reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity_then_ok "$WRAPPER" --retries 2 "x" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "--retries 2 retries capacity failures then succeeds (3 calls)" || fail "--retries 2" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=capacity "$WRAPPER" --retries 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 6 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--retries 0 does not retry (exit 6 after 1 call)" || fail "--retries 0" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l)"
+
+echo "integer inputs are validated before anything runs"
+reset; out="$(DEVIN_TASK_RETRY_BASE=abc STUB_MODE=capacity "$WRAPPER" --retries 1 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "DEVIN_TASK_RETRY_BASE" && [ ! -f "$STUB_CALLS" ] \
+  && ok "non-integer DEVIN_TASK_RETRY_BASE -> exit 2 before any devin call (not exit 0)" \
+  || fail "RETRY_BASE validation" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) out=$out"
+reset; out="$("$WRAPPER" --retries abc "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && ! echo "$out" | grep -qi "integer expression expected" \
+  && ok "--retries abc -> exit 2, no bash arithmetic noise on stderr" || fail "--retries validation" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --timeout abc "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--timeout" && ok "--timeout abc -> exit 2" || fail "--timeout validation" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --timeout 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && ok "--timeout 0 -> exit 2 (a pass needs at least a second)" || fail "--timeout 0" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --max-passes 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--max-passes" && ok "--max-passes 0 -> exit 2" || fail "--max-passes validation" "rc=$rc out=$out"
+
 echo "--until loop"
 cat > "$TMP/check.sh" <<'CHK'
 #!/usr/bin/env bash
@@ -139,13 +258,56 @@ reset; rm -f "$CHECK_COUNT"; out="$(STUB_MODE=reject "$WRAPPER" --until "$TMP/ch
 reset; rm -f "$CHECK_COUNT"; out="$("$WRAPPER" --until "$TMP/check.sh" --json "label" 2>/dev/null)"
 echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==3' 2>/dev/null && ok "--json reports pass count" || fail "json passes" "$out"
 
-echo "live (real devin, free model)"
-PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG
-out="$(cd "$TMP" && "$WRAPPER" --timeout 60 "Reply with exactly the word PONG and nothing else." 2>&1)"; rc=$?
-[ $rc -eq 0 ] && echo "$out" | grep -q PONG && ok "real devin round-trip" || fail "live" "rc=$rc out=$out"
-printf 'a\nb\nc\n' > "$TMP/f.txt"
-out="$(cd "$TMP" && "$WRAPPER" --answer-only --timeout 90 "Run exactly: head -2 f.txt   then reply with only the output, nothing else." 2>&1)"; rc=$?
-[ $rc -eq 0 ] && echo "$out" | grep -q "^b" && ok "live read-only head via allowlist, answer-only" || fail "live allowlist" "rc=$rc out=$out"
+echo "empty-turn detection"
+reset; out="$("$WRAPPER" "say hi" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "normal export -> 1 call, no false-positive nudge" || fail "no false positive" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null)"
+reset; out="$(STUB_MODE=empty_then_ok "$WRAPPER" "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "empty turn then normal -> exit 0, 2 calls" || fail "empty then normal" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+paste -sd' ' "$STUB_ARGV.2" | grep -qF -- "-r stub-sess" && ok "nudge pass resumes the session by id" || fail "nudge resume" "$(cat "$STUB_ARGV.2" 2>/dev/null)"
+grep -qF "Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer." "$STUB_PROMPT.2" && ok "nudge pass prompt file contains the nudge text verbatim" || fail "nudge prompt text" "$(cat "$STUB_PROMPT.2" 2>/dev/null)"
+reset; out="$(STUB_MODE=empty "$WRAPPER" "do the task" 2>&1)"; rc=$?
+[ $rc -eq 9 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "empty twice -> exit 9 after exactly 2 calls" || fail "empty twice" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+reset; out="$(STUB_MODE=empty "$WRAPPER" --no-empty-retry "do the task" 2>&1)"; rc=$?
+[ $rc -eq 9 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--no-empty-retry on empty -> exit 9 after 1 call" || fail "--no-empty-retry" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null)"
+reset; out="$(STUB_MODE=empty_then_ok "$WRAPPER" --json "do the task" 2>/dev/null)"
+echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==1, d["passes"]' 2>/dev/null && ok "--json after a nudge reports passes unchanged (nudge not counted)" || fail "json passes after nudge" "$out"
+
+echo "empty-turn detection uses only the current pass's steps (cumulative export)"
+cat > "$TMP/check2.sh" <<'CHK2'
+#!/usr/bin/env bash
+n=$(cat "$CHECK2_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CHECK2_COUNT"
+echo "check call $n"; [ "$n" -ge 2 ]
+CHK2
+chmod +x "$TMP/check2.sh"; export CHECK2_COUNT="$TMP/count2"
+reset; rm -f "$CHECK2_COUNT"; out="$(STUB_MODE=until_empty_pass2 "$WRAPPER" --until "$TMP/check2.sh" --max-passes 5 "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "an --until resume that appends only empty steps still triggers the nudge (3 calls), then exits 0" || fail "cumulative-export offset fix" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+paste -sd' ' "$STUB_ARGV.3" | grep -qF -- "-r stub-sess" && ok "the nudge (call 3) resumes the session by id" || fail "cumulative nudge resume" "$(cat "$STUB_ARGV.3" 2>/dev/null)"
+grep -qF "Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer." "$STUB_PROMPT.3" && ok "the nudge (call 3) prompt file contains the nudge text verbatim" || fail "cumulative nudge prompt" "$(cat "$STUB_PROMPT.3" 2>/dev/null)"
+
+echo "is_empty_turn tolerates a non-object export"
+reset; out="$(STUB_MODE=list_export "$WRAPPER" "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ! echo "$out" | grep -q "Traceback" && ok "a non-object (e.g. list) export is treated as not-empty, no traceback, 1 call" || fail "non-object export" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) out=$out"
+reset; out="$(STUB_MODE=list_export "$WRAPPER" --json "do the task" 2>"$TMP/err")"; rc=$?
+! grep -q "Traceback" "$TMP/err" && echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["exit_code"]==0, d; assert d["session_id"]=="", d' 2>/dev/null \
+  && ok "--json over a non-object export: valid JSON on stdout, no traceback" || fail "--json non-object export" "rc=$rc out=$out err=$(cat "$TMP/err")"
+reset; out="$(STUB_MODE=list_export "$WRAPPER" --answer-only "do the task" 2>"$TMP/err")"; rc=$?
+! grep -q "Traceback" "$TMP/err" && ok "--answer-only over a non-object export: no traceback" || fail "--answer-only non-object export" "rc=$rc out=$out err=$(cat "$TMP/err")"
+
+echo "the nudge pass is retried like any other pass (--retries)"
+reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --retries 1 "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "a capacity failure during the nudge is retried like the main pass (3 calls, exit 0)" || fail "nudge retried" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+
+if [ "${DEVIN_TASK_TEST_NO_LIVE:-0}" = "1" ]; then
+  echo "live: skipped"
+else
+  echo "live (real devin, free model)"
+  PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG
+  out="$(cd "$TMP" && "$WRAPPER" --timeout 60 "Reply with exactly the word PONG and nothing else." 2>&1)"; rc=$?
+  [ $rc -eq 0 ] && echo "$out" | grep -q PONG && ok "real devin round-trip" || fail "live" "rc=$rc out=$out"
+  printf 'a\nb\nc\n' > "$TMP/f.txt"
+  out="$(cd "$TMP" && "$WRAPPER" --answer-only --timeout 90 "Run exactly: head -2 f.txt   then reply with only the output, nothing else." 2>&1)"; rc=$?
+  [ $rc -eq 0 ] && echo "$out" | grep -q "^b" && ok "live read-only head via allowlist, answer-only" || fail "live allowlist" "rc=$rc out=$out"
+fi
 
 echo; echo "passed=$PASS failed=$FAIL"
 [ $FAIL -eq 0 ]

@@ -8,6 +8,7 @@
 #
 # Permission (default is read-only: file tools plus a read-only shell allowlist):
 #   --edit               also allow file edits in the workspace      (accept-edits)
+#   --smart              additionally auto-run actions a fast model judges safe (smart)
 #   --yolo               auto-approve everything, incl. any command  (dangerous)
 #   --allow 'Exec(cmd)'  add a Devin permission rule (repeatable), e.g. 'Exec(python3 -c)'
 # Run:
@@ -18,17 +19,37 @@
 #   --inherit-env        prepend the caller's python3/node paths and CONDA_PREFIX
 #   --until CMD          rerun (resuming the session) until `bash -c CMD` exits 0
 #   --max-passes N       cap for --until, default 5; exit 5 when exhausted
+#   --retries N          retry capacity/rate-limit failures (exit 6), default 1;
+#                        sleeps 5*attempt seconds between attempts, overridable
+#                        via DEVIN_TASK_RETRY_BASE (seconds)
+#   --no-empty-retry     don't nudge-resume an empty turn once; still exit 9
 # Output:
 #   --answer-only        print only Devin's final message
 #   --json               print {answer, session_id, exit_code, passes, tool_calls}
 #   --trace              heartbeat to stderr while running; tool-call list after
 #
-# Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted, 124 timeout.
+# On a failed pass, Devin's stderr/stdout is classified (transient-first: capacity,
+# internal error, auth, rate limit); the refusal check above keeps precedence over
+# this classification.
+#
+# An "empty turn" (a pass that exits 0 with no agent message and no tool call) is
+# a known upstream failure on swe-1-7* models. The wrapper resumes the session
+# once with a fixed nudge prompt; if still empty, it exits 9. A nudge pass never
+# counts against --max-passes, but a capacity or rate-limit failure during it is
+# retried under --retries like any other pass.
+#
+# Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted,
+#             6 capacity or rate limit (retryable), 7 upstream internal error,
+#             8 authentication failure, 9 empty turn persisted after nudge,
+#             124 timeout, 143 killed by SIGTERM/SIGINT.
 set -u
 
 MODEL="swe-1-7-medium"; PERM="auto"; TIMEOUT=600; CWD=""
 PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
 ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
+RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-5}"
+NO_EMPTY_RETRY=0
+NUDGE_PROMPT='Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer.'
 ALLOW_EXTRA=()
 HEARTBEAT="${DEVIN_TASK_HEARTBEAT:-30}"
 USER_CONFIG="${DEVIN_TASK_USER_CONFIG:-$HOME/.config/devin/config.json}"
@@ -46,12 +67,33 @@ kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL straggl
   local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
   kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
 }
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
+
+# ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
+# Transient-first order: capacity, internal error, auth, rate limit.
+classify_failure() {  # $1 stderr-file  $2 stdout-file
+  local text
+  text="$(cat "$1" "$2" 2>/dev/null)"
+  if printf '%s' "$text" | grep -qiE 'high demand|try again later|currently (busy|overloaded|at capacity)|temporarily (busy|overloaded|unavailable)|server is busy|overloaded|capacity'; then
+    echo "devin-task: upstream failure classified as capacity (retryable); exit 6" >&2
+    RC=6
+  elif printf '%s' "$text" | grep -qiE 'internal error occurred|internal error'; then
+    echo "devin-task: upstream failure classified as internal error; exit 7" >&2
+    RC=7
+  elif printf '%s' "$text" | grep -qiE 'permission_denied|unauthenticated|unauthorized|invalid.*(api ?key|token)|authentication failed'; then
+    echo "devin-task: upstream failure classified as authentication failure; exit 8" >&2
+    RC=8
+  elif printf '%s' "$text" | grep -qiE 'rate.?limit|too many requests|resource_exhausted'; then
+    echo "devin-task: upstream failure classified as rate limit (retryable); exit 6" >&2
+    RC=6
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --edit)        PERM="accept-edits"; shift ;;
+    --smart)       PERM="smart"; shift ;;
     --yolo)        PERM="dangerous"; shift ;;
     --allow)       ALLOW_EXTRA+=("$2"); shift 2 ;;
     --model)       MODEL="$2"; shift 2 ;;
@@ -61,6 +103,8 @@ while [ $# -gt 0 ]; do
     --inherit-env) INHERIT_ENV=1; shift ;;
     --until)       UNTIL="$2"; shift 2 ;;
     --max-passes)  MAX_PASSES="$2"; shift 2 ;;
+    --retries)     RETRIES="$2"; shift 2 ;;
+    --no-empty-retry) NO_EMPTY_RETRY=1; shift ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --answer-only) ANSWER_ONLY=1; shift ;;
     --json)        JSON=1; shift ;;
@@ -71,6 +115,15 @@ while [ $# -gt 0 ]; do
     *)             PROMPT="$*"; break ;;
   esac
 done
+
+# ---- integer inputs: an unvalidated one aborts an arithmetic expansion under
+# set -u mid-run, which would fire the EXIT trap and exit 0 after a failed pass ----
+case "$RETRIES" in ''|*[!0-9]*) die "--retries needs a non-negative integer (got '$RETRIES')" ;; esac
+case "$RETRY_BASE" in ''|*[!0-9]*) die "DEVIN_TASK_RETRY_BASE needs a non-negative integer (got '$RETRY_BASE')" ;; esac
+case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout needs a positive integer (got '$TIMEOUT')" ;; esac
+[ "$TIMEOUT" -ge 1 ] || die "--timeout needs a positive integer (got '$TIMEOUT')"
+case "$MAX_PASSES" in ''|*[!0-9]*) die "--max-passes needs a positive integer (got '$MAX_PASSES')" ;; esac
+[ "$MAX_PASSES" -ge 1 ] || die "--max-passes needs a positive integer (got '$MAX_PASSES')"
 
 # ---- prompt: --prompt-file > positional > stdin ----
 if [ -n "$PROMPT_FILE" ]; then
@@ -160,7 +213,30 @@ run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdou
     esac
     echo "devin-task: Devin refused an action in '$PERM' mode and stopped. $hint Partial edits may already be on disk; check git status." >&2
     RC=3
+  elif [ "$RC" -ne 0 ]; then
+    classify_failure "$WORK/stderr" "${so:-$WORK/stdout}"
   fi
+}
+
+# ---- run_pass, retrying capacity/rate-limit failures (exit 6) up to
+# --retries times; sets RC. Used for the main/--until pass and the empty-
+# turn nudge alike, so a transient failure is retried the same way either
+# time. $5 is a label for the --trace tool-call listing (e.g. "pass 2" or
+# "nudge pass"), printed after every attempt, success or failure. ----
+run_pass_retrying() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdout-file-or-empty  $5 trace-label
+  local pf="$1" ex="$2" sid="$3" so="$4" label="$5" retry_i=0 sleep_s
+  rm -f "$ex"
+  run_pass "$pf" "$ex" "$sid" "$so"
+  [ $TRACE -eq 1 ] && [ -s "$ex" ] && { echo "[devin-task] $label tool calls:" >&2; export_field "$ex" tools | sed 's/^/  /' >&2; }
+  while [ $RC -eq 6 ] && [ "$retry_i" -lt "$RETRIES" ]; do
+    retry_i=$((retry_i+1))
+    sleep_s=$((RETRY_BASE * retry_i))
+    echo "devin-task: retrying transient failure (attempt $retry_i/$RETRIES) in ${sleep_s}s" >&2
+    sleep "$sleep_s"
+    rm -f "$ex"
+    run_pass "$pf" "$ex" "$sid" "$so"
+    [ $TRACE -eq 1 ] && [ -s "$ex" ] && { echo "[devin-task] $label tool calls:" >&2; export_field "$ex" tools | sed 's/^/  /' >&2; }
+  done
 }
 
 # ---- export helpers (need python3) ----
@@ -169,6 +245,7 @@ export_field() {  # $1 export-file  $2 what: answer|session|tools
   python3 - "$1" "$2" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1])); what = sys.argv[2]
+if not isinstance(d, dict): d = {}
 steps = d.get("steps", [])
 if what == "session":
     print(d.get("session_id", ""))
@@ -184,15 +261,77 @@ elif what == "tools":
 PY
 }
 
+# ---- number of steps in EXPORT; 0 if no python3, missing, or unparseable ----
+step_count() {  # $1 export-file
+  if [ $HAVE_PY -eq 1 ] && [ -s "$1" ]; then
+    python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d.get("steps", [])))
+except Exception:
+    print(0)
+PY
+  else
+    echo 0
+  fi
+}
+
+# ---- true (exit 0) if, among the steps EXPORT added since $2 (an earlier
+# step count from step_count; 0 for a fresh session), no agent step has a
+# non-empty message and no step has any tool_calls; false (exit 1) if not
+# empty, missing, or unparseable (missing/unparseable is "do nothing", not
+# "empty"). Devin's export on a resumed session is cumulative, so $2 lets
+# the check see only what THIS pass added, not earlier passes' content; if
+# $2 turns out to exceed the step list (export wasn't actually cumulative)
+# it falls back to checking every step. ----
+is_empty_turn() {  # $1 export-file  $2 prior-step-count-or-empty
+  [ $HAVE_PY -eq 1 ] && [ -s "$1" ] || return 1
+  python3 - "$1" "${2:-0}" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    steps = d.get("steps", [])
+except Exception:
+    sys.exit(1)
+offset = int(sys.argv[2])
+if offset < 0 or offset > len(steps):
+    offset = 0
+new_steps = steps[offset:]
+has_msg = any(s.get("source") == "agent" and (s.get("message") or "").strip() for s in new_steps)
+has_tools = any(s.get("tool_calls") for s in new_steps)
+sys.exit(0 if not has_msg and not has_tools else 1)
+PY
+}
+
 # ---- main loop ----
 PASS=1; SESSION=""; EXPORT="$WORK/export.json"
 CAPTURE=""; [ $ANSWER_ONLY -eq 1 ] || [ $JSON -eq 1 ] && CAPTURE="$WORK/stdout"
 printf '%s' "$PROMPT" > "$WORK/prompt.md"
 while :; do
-  rm -f "$EXPORT"
-  run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
-  [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
+  PREV_STEPS="$(step_count "$EXPORT")"
+  run_pass_retrying "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE" "pass $PASS"
   [ $RC -ne 0 ] && break
+  if is_empty_turn "$EXPORT" "$PREV_STEPS"; then
+    if [ $NO_EMPTY_RETRY -eq 1 ]; then
+      echo "devin-task: pass produced no message and no tool call (empty turn); --no-empty-retry set, not resuming; exit 9" >&2
+      RC=9; break
+    fi
+    NUDGE_SID="$(export_field "$EXPORT" session 2>/dev/null || true)"
+    if [ -z "$NUDGE_SID" ]; then
+      echo "devin-task: pass produced no message and no tool call (empty turn), and no session id to resume; exit 9" >&2
+      RC=9; break
+    fi
+    NUDGE_PREV_STEPS="$(step_count "$EXPORT")"
+    echo "devin-task: pass produced no message and no tool call (empty turn); resuming session once with a nudge" >&2
+    printf '%s' "$NUDGE_PROMPT" > "$WORK/nudge.md"
+    run_pass_retrying "$WORK/nudge.md" "$EXPORT" "$NUDGE_SID" "$CAPTURE" "nudge pass"
+    [ $RC -ne 0 ] && break
+    if is_empty_turn "$EXPORT" "$NUDGE_PREV_STEPS"; then
+      echo "devin-task: resumed pass still produced no message and no tool call; exit 9" >&2
+      RC=9; break
+    fi
+  fi
   [ -z "$UNTIL" ] && break
   CHECK_OUT="$(bash -c "$UNTIL" 2>&1)"; CHECK_RC=$?
   if [ $CHECK_RC -eq 0 ]; then
@@ -228,6 +367,7 @@ d = {}
 if os.path.isfile(ex) and os.path.getsize(ex):
     try: d = json.load(open(ex))
     except Exception: d = {}
+    if not isinstance(d, dict): d = {}
 steps = d.get("steps", [])
 msgs = [s.get("message") for s in steps if s.get("source") == "agent" and (s.get("message") or "").strip()]
 answer = msgs[-1] if msgs else (open(so).read().strip() if os.path.isfile(so) else "")

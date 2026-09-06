@@ -50,20 +50,81 @@ printf '%s' "$PROMPT" | devin-task [flags]
 |---|---|
 | (none) | read-only: file tools plus a read-only shell allowlist (below) |
 | `--edit` | also write files in the workspace; still no commands beyond the allowlist |
+| `--smart` | passes Devin's `--permission-mode smart` (per Devin's help: "additionally auto-runs actions a fast model judges safe"); still gets the generated read-only allowlist. On this account Devin currently reports it "not available" and falls back to normal (see below) |
 | `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote |
 | `--allow 'Exec(prefix)'` | add a Devin permission rule, repeatable, e.g. `'Exec(python3 -c)'` |
-| `--model M` | default `swe-1-7-medium`; `swe-1-7` and `glm-5-2` are also free at time of writing |
+| `--model M` | default `swe-1-7-medium`; `swe-1-7` and `glm-5-2` are also free at time of writing. Free-ness may be plan-specific: other tooling treats those three as quota-exempt on Pro plans, while a true free-tier account may only reach `swe-1-6-slow`. Run `devin models list` for what's actually free on your account |
 | `--cwd DIR` | run there instead of `cd DIR &&` (which trips Claude Code's cwd-reset warning) |
 | `--timeout S` | per-pass wall clock, default 600; exit 124 and the process tree is killed |
 | `--preamble T` | prepend standing instructions; also `DEVIN_TASK_PREAMBLE` |
 | `--inherit-env` | prepend the caller's `python3`, `node` and `CONDA_PREFIX` so Devin uses them |
 | `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
+| `--retries N` | retry capacity/rate-limit failures (exit 6) only, default 1; sleeps `5 × attempt` seconds between attempts, overridable via `DEVIN_TASK_RETRY_BASE` |
+| `--no-empty-retry` | don't nudge-resume an empty turn (below) once; detection still runs and still exits 9 |
 | `--answer-only` | print only Devin's final message |
-| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is |
+| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is; `passes` counts only `--until` passes — a nudge pass (below) is never counted |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
-Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted, 124 timeout.
+Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
+6 capacity or rate limit (retryable), 7 upstream internal error,
+8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout,
+143 the wrapper was killed by SIGTERM or SIGINT.
+
+`--retries`, `--timeout` and `--max-passes` (and `DEVIN_TASK_RETRY_BASE`) are
+checked before the first pass; a non-integer value is a usage error (exit 2).
+
+### Classifying upstream failures, and `--retries`
+
+When a pass exits non-zero, the wrapper scans Devin's stderr (and captured
+stdout) for known upstream failure text, checked in this order so a
+transient error is never misread as a dead login:
+
+1. **capacity** (exit 6) — `high demand`, `try again later`, `currently
+   busy/overloaded/at capacity`, `server is busy`, `overloaded`, `capacity`
+2. **internal error** (exit 7) — `internal error occurred` / `internal
+   error`. Devin sometimes wraps this inside a 401/403-looking message, so
+   it is matched before the auth patterns below.
+3. **auth** (exit 8) — `permission_denied`, `unauthenticated`,
+   `unauthorized`, `invalid ... api key/token`, `authentication failed`
+4. **rate limit** (exit 6) — `rate limit`, `too many requests`,
+   `resource_exhausted`
+
+The existing refusal detection (a rejected tool call → exit 3) keeps
+precedence over all of these. Only exit-6 conditions (capacity, rate limit)
+are retried, up to `--retries N` times (default 1), sleeping `5 × attempt`
+seconds between attempts (5s, then 10s, ...) before re-running the same
+pass — a fresh pass, not a session resume, though a pass already resumed
+under `--until` stays resumed. Set `DEVIN_TASK_RETRY_BASE` to change the
+5-second base (tests use `0`).
+
+### Empty turns and `--no-empty-retry`
+
+On `swe-1-7*` models, a pass sometimes exits 0 having spent the whole turn in
+reasoning and emitted nothing: no `agent` step has a non-empty message, and no
+step has any tool call. The wrapper checks for this after every pass (before
+the `--until` check, so it runs on `--until` passes too) and, on detection,
+resumes the same session once (`-r SESSION_ID`) with exactly:
+
+> Your previous turn produced no message and no tool call. Continue the task
+> now and finish with a written answer.
+
+If the resumed pass is still empty, the wrapper exits 9 with a stderr line.
+If the export is missing or unparseable, the check does nothing — it is not
+treated as empty. `--no-empty-retry` skips the resume; detection still runs,
+so an empty turn still exits 9, just after one call instead of two. A nudge
+pass is never counted in `--json`'s `passes` and never counts against
+`--max-passes`. An empty turn itself is not a `--retries` condition: it gets
+its own single nudge. The nudge pass is otherwise an ordinary pass, so if it
+fails with capacity or rate-limit text it is retried under `--retries` like
+any other pass, and those attempts do consume the retry budget.
+
+Devin's export is cumulative across a resumed session (see the `--json` row
+above), so the check only looks at the steps the current pass actually added
+since the last one — the step count before the pass, remembered across
+resumes — rather than the whole export, so an empty pass is still caught on
+pass 3+ of an `--until` run even though earlier passes' content is still in
+the same export.
 
 ### Read-only shell allowlist
 
@@ -141,10 +202,16 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Forty-nine checks against a stub `devin` on PATH (argv, generated config and
+Seventy-seven checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
-timeout, signal propagation, the `--until` loop) plus two live calls on the
-free model.
+timeout, signal propagation, failure classification, `--retries`, integer
+validation of the numeric flags, the `--until` loop, empty-turn detection and
+`--no-empty-retry`, including a cumulative-export case where a later `--until`
+pass adds only empty steps, a non-object export, and a capacity failure
+retried during the nudge) plus two live calls on the free model. Set
+`DEVIN_TASK_TEST_NO_LIVE=1` to skip the two live calls (prints `live: skipped`
+instead). CI runs this suite with that var set, and the ACP suite, which makes
+no live calls, as it is, on every push and pull request.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file
@@ -161,3 +228,65 @@ install.sh            symlinks into ~/.claude/skills and ~/.local/bin
 ```
 
 MIT.
+
+## Experimental: ACP transport
+
+`scripts/devin-task-acp` is a spike, not part of the skill. It drives `devin
+acp` — the Agent Client Protocol server, JSON-RPC 2.0 over stdio — instead of
+print mode, in Python 3 with nothing but the standard library:
+
+```bash
+scripts/devin-task-acp --trace "summarise README.md in one line"
+scripts/devin-task-acp --json --approve none "what would you run for X?"
+```
+
+Two things ACP buys over print mode: tool calls arrive as they happen, so
+`--trace` streams them live, and every shell command comes back as a
+`session/request_permission` request that this script answers itself, so the
+permission policy lives here instead of in a generated Devin config.
+
+`--approve` picks that policy:
+
+- `read` (default) allows a command only if all three hold: nothing anywhere in
+  the string spawns a command or opens a file for writing (no backtick, `$(…)`,
+  `<(…)`, `>(…)` or `>` — only a true descriptor duplication, `2>&1`, `>&2` or
+  `>&-`, is exempt; `>&file` is a redirect and is denied); **every** `&&` /
+  `||` / `;` / `|` / `&` separated segment starts with one of
+  cat head tail sed grep rg wc ls stat file diff jq cut tr uniq pwd which, or
+  `git`; and no segment is an in-place `sed` (`-i`, `-i.bak`, `-I`,
+  `--in-place`, or a bundled cluster such as `-ni.bak`) or a
+  `git` outside log/status/diff/show or carrying `--output`.
+- `all` allows everything, `none` cancels everything (a dry run of what Devin
+  would reach for).
+
+Anything cancelled is printed to stderr as `denied: <command>`. A denial does
+not end the run: Devin continues, says the command was rejected, and still
+finishes with `end_turn`.
+
+Other flags mirror the wrapper: `--model`, `--timeout`, `--cwd`,
+`--prompt-file`, `--json`, `--trace`, positional or stdin prompt.
+`--answer-only` drops the trailing stats line; stdout is only the agent's
+message either way. Exit codes: 0 ok, 2 usage, 3 something was denied and the
+answer came back empty, 124 timeout, 143 signalled, 1 JSON-RPC error.
+
+Not covered yet: no `--edit` equivalent, no `--until` loop, no session resume,
+no `--allow` for extra rules.
+
+The `read` policy is a word match over the raw string, not a shell parser, and
+it errs towards denying. It refuses every redirection (`>`, `>>`, `&>`), every
+substitution (backtick, `$(…)`, `<(…)`, `>(…)`) and every chaining operator
+that introduces a non-allowlisted command — which also means it refuses
+harmless ones: `cd sub && cat f` is denied because `cd` is not on the list, and
+quoting is not understood, so `grep -E "a|b" f` and `sed -n 's/a;b/c/p' f` are
+denied over the `|` and `;` inside the quotes. A
+`shlex(punctuation_chars=True)` tokeniser would fix the quoting cases and is
+the obvious follow-up. The checks are this blunt because a live run had Devin
+fold two requested commands into a single chained one, and each looser version
+of the rule had a way to smuggle a write past it.
+
+```bash
+bash tests/test_devin_task_acp.sh
+```
+
+Sixty-three checks against a stub `devin` that speaks enough of the protocol.
+No live call in there; the spike's live check is run by hand.
