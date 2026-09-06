@@ -195,11 +195,12 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Sixty-six checks against a stub `devin` on PATH (argv, generated config and
+Sixty-eight checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries`, the
 `--until` loop, empty-turn detection and `--no-empty-retry`, including a
-cumulative-export case where a later `--until` pass adds only empty steps)
+cumulative-export case where a later `--until` pass adds only empty steps,
+a non-object export, and a capacity failure retried during the nudge)
 plus two live calls on the free model.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp

@@ -55,7 +55,13 @@ case "${STUB_MODE:-ok}" in
     ;;
   empty)
     echo "narrative line"
-    [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    if [ -n "$EXPORT" ]; then
+      if [ "$n" -lt 2 ]; then
+        printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+      else
+        printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+      fi
+    fi
     ;;
   empty_then_ok)
     if [ "$n" -lt 2 ]; then
@@ -80,6 +86,27 @@ case "${STUB_MODE:-ok}" in
     else
       echo "narrative line"; echo "STUB-OK"
       [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"},{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
+  list_export)
+    # a syntactically valid export that is not an object (a top-level JSON
+    # list): must not crash is_empty_turn/step_count with a traceback.
+    echo "narrative line"; echo "STUB-OK"
+    [ -n "$EXPORT" ] && printf '%s' '[1,2,3]' > "$EXPORT"
+    ;;
+  empty_then_capacity_then_ok)
+    # call 1 is empty (triggers the nudge); call 2 (the nudge's first
+    # attempt) fails with capacity text; call 3 (the nudge's retry, via
+    # --retries) succeeds. Proves a transient failure during the nudge is
+    # retried the same way a transient failure in the main pass is.
+    if [ "$n" -eq 1 ]; then
+      echo "narrative line"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    elif [ "$n" -eq 2 ]; then
+      echo "Error: currently overloaded, try again later" >&2; exit 1
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
     fi
     ;;
 esac
@@ -237,6 +264,14 @@ reset; rm -f "$CHECK2_COUNT"; out="$(STUB_MODE=until_empty_pass2 "$WRAPPER" --un
 [ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "an --until resume that appends only empty steps still triggers the nudge (3 calls), then exits 0" || fail "cumulative-export offset fix" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
 paste -sd' ' "$STUB_ARGV.3" | grep -qF -- "-r stub-sess" && ok "the nudge (call 3) resumes the session by id" || fail "cumulative nudge resume" "$(cat "$STUB_ARGV.3" 2>/dev/null)"
 grep -qF "Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer." "$STUB_PROMPT.3" && ok "the nudge (call 3) prompt file contains the nudge text verbatim" || fail "cumulative nudge prompt" "$(cat "$STUB_PROMPT.3" 2>/dev/null)"
+
+echo "is_empty_turn tolerates a non-object export"
+reset; out="$(STUB_MODE=list_export "$WRAPPER" "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ! echo "$out" | grep -q "Traceback" && ok "a non-object (e.g. list) export is treated as not-empty, no traceback, 1 call" || fail "non-object export" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) out=$out"
+
+echo "the nudge pass is retried like any other pass (--retries)"
+reset; out="$(DEVIN_TASK_RETRY_BASE=0 STUB_MODE=empty_then_capacity_then_ok "$WRAPPER" --retries 1 "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "a capacity failure during the nudge is retried like the main pass (3 calls, exit 0)" || fail "nudge retried" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
 
 echo "live (real devin, free model)"
 PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG

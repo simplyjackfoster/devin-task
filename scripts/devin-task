@@ -206,6 +206,27 @@ run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdou
   fi
 }
 
+# ---- run_pass, retrying capacity/rate-limit failures (exit 6) up to
+# --retries times; sets RC. Used for the main/--until pass and the empty-
+# turn nudge alike, so a transient failure is retried the same way either
+# time. $5 is a label for the --trace tool-call listing (e.g. "pass 2" or
+# "nudge pass"), printed after every attempt, success or failure. ----
+run_pass_retrying() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdout-file-or-empty  $5 trace-label
+  local pf="$1" ex="$2" sid="$3" so="$4" label="$5" retry_i=0 sleep_s
+  rm -f "$ex"
+  run_pass "$pf" "$ex" "$sid" "$so"
+  [ $TRACE -eq 1 ] && [ -s "$ex" ] && { echo "[devin-task] $label tool calls:" >&2; export_field "$ex" tools | sed 's/^/  /' >&2; }
+  while [ $RC -eq 6 ] && [ "$retry_i" -lt "$RETRIES" ]; do
+    retry_i=$((retry_i+1))
+    sleep_s=$((RETRY_BASE * retry_i))
+    echo "devin-task: retrying transient failure (attempt $retry_i/$RETRIES) in ${sleep_s}s" >&2
+    sleep "$sleep_s"
+    rm -f "$ex"
+    run_pass "$pf" "$ex" "$sid" "$so"
+    [ $TRACE -eq 1 ] && [ -s "$ex" ] && { echo "[devin-task] $label tool calls:" >&2; export_field "$ex" tools | sed 's/^/  /' >&2; }
+  done
+}
+
 # ---- export helpers (need python3) ----
 export_field() {  # $1 export-file  $2 what: answer|session|tools
   [ $HAVE_PY -eq 1 ] && [ -s "$1" ] || return 1
@@ -257,9 +278,9 @@ is_empty_turn() {  # $1 export-file  $2 prior-step-count-or-empty
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
+    steps = d.get("steps", [])
 except Exception:
     sys.exit(1)
-steps = d.get("steps", [])
 offset = int(sys.argv[2])
 if offset < 0 or offset > len(steps):
     offset = 0
@@ -276,19 +297,7 @@ CAPTURE=""; [ $ANSWER_ONLY -eq 1 ] || [ $JSON -eq 1 ] && CAPTURE="$WORK/stdout"
 printf '%s' "$PROMPT" > "$WORK/prompt.md"
 while :; do
   PREV_STEPS="$(step_count "$EXPORT")"
-  rm -f "$EXPORT"
-  run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
-  [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
-  RETRY_I=0
-  while [ $RC -eq 6 ] && [ "$RETRY_I" -lt "$RETRIES" ]; do
-    RETRY_I=$((RETRY_I+1))
-    SLEEP_S=$((RETRY_BASE * RETRY_I))
-    echo "devin-task: retrying transient failure (attempt $RETRY_I/$RETRIES) in ${SLEEP_S}s" >&2
-    sleep "$SLEEP_S"
-    rm -f "$EXPORT"
-    run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
-    [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
-  done
+  run_pass_retrying "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE" "pass $PASS"
   [ $RC -ne 0 ] && break
   if is_empty_turn "$EXPORT" "$PREV_STEPS"; then
     if [ $NO_EMPTY_RETRY -eq 1 ]; then
@@ -303,9 +312,7 @@ while :; do
     NUDGE_PREV_STEPS="$(step_count "$EXPORT")"
     echo "devin-task: pass produced no message and no tool call (empty turn); resuming session once with a nudge" >&2
     printf '%s' "$NUDGE_PROMPT" > "$WORK/nudge.md"
-    rm -f "$EXPORT"
-    run_pass "$WORK/nudge.md" "$EXPORT" "$NUDGE_SID" "$CAPTURE"
-    [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] nudge pass tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
+    run_pass_retrying "$WORK/nudge.md" "$EXPORT" "$NUDGE_SID" "$CAPTURE" "nudge pass"
     [ $RC -ne 0 ] && break
     if is_empty_turn "$EXPORT" "$NUDGE_PREV_STEPS"; then
       echo "devin-task: resumed pass still produced no message and no tool call; exit 9" >&2
