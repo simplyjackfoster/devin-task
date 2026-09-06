@@ -22,6 +22,7 @@ devin-task --trace "prompt"                           # heartbeat on stderr + to
 devin-task --retries 2 "prompt"                       # retry connection/capacity/rate-limit failures (exit 6)
 devin-task --retries 3 --backoff 60 "prompt"          # 60s x attempt between retries (default 30)
 devin-task --max-concurrent 5 "prompt"                # machine-wide cap on simultaneous devin passes
+devin-task --until 'CHK' --progress 'COUNT' "prompt"  # stop on stalled progress, not on a pass count
 devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
 ```
 
@@ -73,6 +74,17 @@ with the check's exit code and last 40 lines of output, so Devin sees exactly
 what is still missing. `--max-passes` (default 5) exhausted gives exit 5.
 Write the check to print what is missing, not just fail.
 
+For a job whose size you do not know up front, bound it by progress instead of
+by pass count. `--progress CMD` runs `bash -c CMD` after each pass; it must
+print a single integer (rows done, files written). A pass that raises it resets
+the stall counter and the run keeps going — `--progress` replaces
+`--max-passes`, which is then ignored. `--max-stalls N` consecutive passes
+without a gain (default 5) end the run with exit 5, naming the stall count and
+last value. `--until` still decides success. The value and the change since the
+last pass go into the resume prompt next to the check output. The command is
+baselined once before pass 1; a failing or non-integer reading there is exit 2,
+but the same thing later is just a stall.
+
 ## Concurrency
 
 Concurrent runs in one directory do not interfere — each has its own session,
@@ -93,7 +105,8 @@ For a batch job the settings that ran clean were
 
 - Exit 3: refused action. The message names the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
-- Exit 5: `--until` check still failing after `--max-passes`. Its last output is on stderr.
+- Exit 5: `--until` check still failing after `--max-passes`, or `--max-stalls`
+  consecutive passes with no `--progress` gain. Its last output is on stderr.
 - Exit 6: upstream connection error, capacity or rate-limit error, or no free
   `--max-concurrent` slot within `--slot-timeout` (all retryable).
   Devin's own "Connection error, send a message to continue retrying" counts.
@@ -117,7 +130,7 @@ For a batch job the settings that ran clean were
 - Exit 143: the wrapper itself was killed by SIGTERM or SIGINT. It kills
   Devin's process tree on the way out, so nothing is left running.
 - Exit 2 also covers a non-integer `--retries`, `--backoff`, `--timeout`,
-  `--max-passes`, `--max-concurrent`, `--slot-timeout` or
+  `--max-passes`, `--max-concurrent`, `--slot-timeout`, `--max-stalls` or
   `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
@@ -131,4 +144,4 @@ For a batch job the settings that ran clean were
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (95 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (106 stub-devin checks plus two live calls).

@@ -44,6 +44,25 @@ case "${STUB_MODE:-ok}" in
   internal)  echo "Error: internal error occurred (trace ID: abcd1234)" >&2; exit 1 ;;
   auth)      echo "Error: request unauthorized: invalid api key" >&2; exit 1 ;;
   ratelimit) echo "Error: too many requests, rate limit exceeded" >&2; exit 1 ;;
+  advance)
+    # advances $STUB_COUNTER by $STUB_GAIN (default 1) on every call, or only
+    # on the call numbers listed in $STUB_GAIN_CALLS, so a --progress test can
+    # script exactly which passes make forward progress. The export is
+    # cumulative like `ok` so a later pass never looks like an empty turn.
+    g="${STUB_GAIN:-1}"
+    if [ -n "${STUB_GAIN_CALLS:-}" ]; then
+      case " $STUB_GAIN_CALLS " in *" $n "*) ;; *) g=0 ;; esac
+    fi
+    cur=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0)
+    echo $((cur + g)) > "$STUB_COUNTER"
+    echo "narrative line"; echo "STUB-OK"
+    if [ -n "$EXPORT" ]; then
+      final="{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}"
+      steps="{\"source\":\"user\",\"message\":\"x\"}"
+      i=1; while [ "$i" -le "$n" ]; do steps="$steps,$final"; i=$((i+1)); done
+      printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[$steps],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
   slow3)
     # records wall-clock start/end so a concurrency test can assert two runs
     # never overlapped. $$ keeps the two concurrent stubs apart; STUB_CALLS'
@@ -134,7 +153,7 @@ chmod +x "$TMP/bin/devin"
 printf '%s' '{"agent":{"model":"swe-1-7-medium"},"permissions":{"allow":["Fetch(domain:*)"]}}' > "$TMP/userconfig.json"
 export PATH="$TMP/bin:$PATH" STUB_ARGV="$TMP/argv" STUB_PROMPT="$TMP/prompt" STUB_CWD="$TMP/cwd" \
        STUB_CONFIG="$TMP/config" STUB_CALLS="$TMP/calls" DEVIN_TASK_USER_CONFIG="$TMP/userconfig.json" \
-       DEVIN_TASK_SLOT_DIR="$TMP/slots"
+       DEVIN_TASK_SLOT_DIR="$TMP/slots" STUB_COUNTER="$TMP/counter"
 reset() { rm -f "$STUB_ARGV"* "$STUB_PROMPT"* "$STUB_CONFIG" "$STUB_CALLS"; rm -rf "$TMP/slots"; unset DEVIN_TASK_PREAMBLE; }
 argv_pair() { paste -sd' ' "$STUB_ARGV" | grep -qF -- "$1"; }
 has_arg()   { grep -qxF -- "$1" "$STUB_ARGV"; }
@@ -190,7 +209,7 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
 out="$("$WRAPPER" --help 2>&1)"; rc=$?
-[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--max-concurrent" && echo "$out" | grep -q -- "--slot-timeout" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --max-concurrent, --slot-timeout, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--backoff" && echo "$out" | grep -q -- "--max-concurrent" && echo "$out" | grep -q -- "--slot-timeout" && echo "$out" | grep -q -- "--progress" && echo "$out" | grep -q -- "--max-stalls" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --backoff, --max-concurrent, --slot-timeout, --progress, --max-stalls, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
@@ -340,6 +359,41 @@ reset; rm -f "$CHECK_COUNT"; out="$(STUB_MODE=reject "$WRAPPER" --until "$TMP/ch
 [ $rc -eq 3 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "refusal inside --until stops immediately" || fail "until refusal" "rc=$rc"
 reset; rm -f "$CHECK_COUNT"; out="$("$WRAPPER" --until "$TMP/check.sh" --json "label" 2>/dev/null)"
 echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==3' 2>/dev/null && ok "--json reports pass count" || fail "json passes" "$out"
+
+echo "--progress / --max-stalls"
+PROG='cat '"$TMP"'/counter'
+reset; out="$("$WRAPPER" --max-stalls 0 "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--max-stalls" && ok "--max-stalls 0 -> exit 2" || fail "--max-stalls validation" "rc=$rc $out"
+reset; out="$("$WRAPPER" --until false --progress "echo many" "go" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -qi "single integer" && [ ! -f "$STUB_CALLS" ] && ok "a non-integer --progress reading on pass 1 -> exit 2 before any devin call" || fail "progress non-integer" "rc=$rc $out"
+reset; echo 0 > "$TMP/counter"
+out="$(STUB_MODE=advance "$WRAPPER" --until "[ \"\$(cat $TMP/counter)\" -ge 8 ]" --progress "$PROG" "go" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "8" ] && ok "--progress lets a productive run past the --max-passes default (8 passes, exit 0)" || fail "progress unbounded" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+reset; echo 0 > "$TMP/counter"
+out="$(STUB_GAIN=0 STUB_MODE=advance "$WRAPPER" --until false --progress "$PROG" "go" 2>&1)"; rc=$?
+[ $rc -eq 5 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "5" ] && ok "five zero-gain passes -> exit 5 after exactly 5 stalls" || fail "max-stalls default" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+echo "$out" | grep -q "no progress for 5 consecutive" && echo "$out" | grep -q "last --progress value 0" && ok "the stall message names the stall count and the last value" || fail "stall message" "$out"
+reset; echo 0 > "$TMP/counter"
+out="$(STUB_GAIN_CALLS="4" STUB_MODE=advance "$WRAPPER" --until false --progress "$PROG" "go" 2>&1)"; rc=$?
+[ $rc -eq 5 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "9" ] && ok "a pass that gains resets the stall counter (3 stalls, a gain, then 5 -> 9 passes)" || fail "stall reset" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+reset; echo 0 > "$TMP/counter"
+out="$(STUB_GAIN=0 STUB_MODE=advance "$WRAPPER" --until false --progress "$PROG" --max-stalls 2 "go" 2>&1)"; rc=$?
+[ $rc -eq 5 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "--max-stalls 2 ends the run after 2 stalls" || fail "--max-stalls 2" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+cat > "$TMP/prog_flaky.sh" <<'PF'
+#!/usr/bin/env bash
+n=$(cat "$FLAKY_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$FLAKY_COUNT"
+[ "$n" -eq 1 ] && { echo 0; exit 0; }
+echo "not a number"; exit 1
+PF
+chmod +x "$TMP/prog_flaky.sh"; export FLAKY_COUNT="$TMP/flaky"
+reset; rm -f "$FLAKY_COUNT"
+out="$(STUB_MODE=advance "$WRAPPER" --until false --progress "$TMP/prog_flaky.sh" --max-stalls 2 "go" 2>&1)"; rc=$?
+[ $rc -eq 5 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "a --progress command that fails after pass 1 is a stall, not a usage error" || fail "flaky progress" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+reset; echo 0 > "$TMP/counter"
+STUB_MODE=advance "$WRAPPER" --until "[ \"\$(cat $TMP/counter)\" -ge 3 ]" --progress "$PROG" "go" >/dev/null 2>&1
+grep -q "now reports 1" "$STUB_PROMPT.2" && grep -q "+1 since the last pass" "$STUB_PROMPT.2" && ok "the resume prompt carries the --progress value and the delta" || fail "progress in prompt" "$(cat "$STUB_PROMPT.2" 2>&1)"
+grep -q "still fails" "$STUB_PROMPT.2" && ok "the resume prompt still carries the --until check output" || fail "check output lost" "$(cat "$STUB_PROMPT.2" 2>&1)"
+! grep -q "of 5" "$STUB_PROMPT.2" && ok "with --progress the resume prompt drops the 'of N' pass count" || fail "max-passes still in prompt" "$(cat "$STUB_PROMPT.2" 2>&1)"
 
 echo "empty-turn detection"
 reset; out="$("$WRAPPER" "say hi" 2>&1)"; rc=$?

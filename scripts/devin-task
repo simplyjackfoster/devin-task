@@ -19,6 +19,12 @@
 #   --inherit-env        prepend the caller's python3/node paths and CONDA_PREFIX
 #   --until CMD          rerun (resuming the session) until `bash -c CMD` exits 0
 #   --max-passes N       cap for --until, default 5; exit 5 when exhausted
+#   --progress CMD       after each --until pass run `bash -c CMD`; it must print
+#                        one integer (rows done, files written, ...). A pass that
+#                        does not raise it is a stall. While the number keeps
+#                        rising the run is unbounded: --progress replaces
+#                        --max-passes as the bound on an --until loop
+#   --max-stalls N       consecutive stalls that end the run, default 5; exit 5
 #   --retries N          retry connection/capacity/rate-limit failures (exit 6),
 #                        default 1; sleeps backoff*attempt seconds between attempts
 #   --backoff SECS       retry backoff base in seconds, default 30 (env:
@@ -46,7 +52,8 @@
 # counts against --max-passes, but a capacity or rate-limit failure during it is
 # retried under --retries like any other pass.
 #
-# Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted,
+# Exit codes: 0 ok, 2 usage, 3 Devin refused an action,
+#             5 --until exhausted (--max-passes, or --max-stalls under --progress),
 #             6 connection/capacity/rate limit or no free slot (retryable),
 #             7 upstream internal error,
 #             8 authentication failure, 9 empty turn persisted after nudge,
@@ -59,6 +66,8 @@ ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
 RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-30}"; BACKOFF=""; BACKOFF_SET=0
 NO_EMPTY_RETRY=0
 MAX_CONCURRENT=""; SLOT_TIMEOUT=600; SLOT=""
+PROGRESS=""; MAX_STALLS=5; STALLS=0
+PROG_VALUE=0; PROG_NEW=""; PROG_RAW=""; PROG_RC=0; PROG_DELTA=0; PROG_NOTE=""
 SLOT_DIR="${DEVIN_TASK_SLOT_DIR:-${TMPDIR:-/tmp}/devin-task-slots}"
 NUDGE_PROMPT='Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer.'
 ALLOW_EXTRA=()
@@ -130,7 +139,7 @@ acquire_slot() {  # sets SLOT, or sets RC=6 and returns 1 on --slot-timeout
   done
 }
 
-usage() { sed -n '2,53p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
 
 # ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
@@ -169,6 +178,8 @@ while [ $# -gt 0 ]; do
     --inherit-env) INHERIT_ENV=1; shift ;;
     --until)       UNTIL="$2"; shift 2 ;;
     --max-passes)  MAX_PASSES="$2"; shift 2 ;;
+    --progress)    PROGRESS="$2"; shift 2 ;;
+    --max-stalls)  MAX_STALLS="$2"; shift 2 ;;
     --retries)     RETRIES="$2"; shift 2 ;;
     --backoff)     BACKOFF="$2"; BACKOFF_SET=1; shift 2 ;;
     --max-concurrent) MAX_CONCURRENT="$2"; shift 2 ;;
@@ -199,6 +210,8 @@ if [ -n "$MAX_CONCURRENT" ]; then
   [ "$MAX_CONCURRENT" -ge 1 ] || die "--max-concurrent needs a positive integer (got '$MAX_CONCURRENT')"
 fi
 case "$SLOT_TIMEOUT" in ''|*[!0-9]*) die "--slot-timeout needs a non-negative integer (got '$SLOT_TIMEOUT')" ;; esac
+case "$MAX_STALLS" in ''|*[!0-9]*) die "--max-stalls needs a positive integer (got '$MAX_STALLS')" ;; esac
+[ "$MAX_STALLS" -ge 1 ] || die "--max-stalls needs a positive integer (got '$MAX_STALLS')"
 
 # ---- prompt: --prompt-file > positional > stdin ----
 if [ -n "$PROMPT_FILE" ]; then
@@ -381,10 +394,30 @@ sys.exit(0 if not has_msg and not has_tools else 1)
 PY
 }
 
+# ---- run the --progress command. Sets PROG_NEW to the integer it printed, or
+# to the empty string when the command failed or printed anything that is not a
+# single integer; PROG_RAW/PROG_RC keep the raw result for the error message. ----
+read_progress() {
+  PROG_RAW="$(bash -c "$PROGRESS" 2>&1)"; PROG_RC=$?
+  PROG_NEW="$(printf '%s' "$PROG_RAW" | tr -d '[:space:]')"
+  case "$PROG_NEW" in ''|*[!0-9]*) PROG_NEW="" ;; esac
+  [ $PROG_RC -eq 0 ] || PROG_NEW=""
+}
+
 # ---- main loop ----
 PASS=1; SESSION=""; EXPORT="$WORK/export.json"
 CAPTURE=""; [ $ANSWER_ONLY -eq 1 ] || [ $JSON -eq 1 ] && CAPTURE="$WORK/stdout"
 printf '%s' "$PROMPT" > "$WORK/prompt.md"
+# Baseline the progress measure before pass 1, so pass 1's own gain is measured
+# (a job resumed with rows already done and producing none is a stall). A
+# command that fails or prints a non-integer here is a usage error, caught
+# before the first Devin call; from pass 1 on the same result is a stall.
+if [ -n "$PROGRESS" ]; then
+  read_progress
+  [ -n "$PROG_NEW" ] || die "--progress command must print a single integer on stdout and exit 0; got exit $PROG_RC and: $(printf '%s' "$PROG_RAW" | tr '\n' ' ' | cut -c1-160)"
+  PROG_VALUE="$PROG_NEW"
+  [ $TRACE -eq 1 ] && echo "[devin-task] progress baseline: $PROG_VALUE" >&2
+fi
 while :; do
   PREV_STEPS="$(step_count "$EXPORT")"
   run_pass_retrying "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE" "pass $PASS"
@@ -415,20 +448,41 @@ while :; do
     [ $TRACE -eq 1 ] && echo "[devin-task] check passed after $PASS pass(es)" >&2
     break
   fi
-  if [ $PASS -ge "$MAX_PASSES" ]; then
+  if [ -n "$PROGRESS" ]; then
+    read_progress
+    if [ -n "$PROG_NEW" ] && [ "$PROG_NEW" -gt "$PROG_VALUE" ]; then
+      PROG_DELTA=$((PROG_NEW - PROG_VALUE)); PROG_VALUE="$PROG_NEW"; STALLS=0
+    else
+      PROG_DELTA=0; STALLS=$((STALLS+1))
+      [ -n "$PROG_NEW" ] && PROG_VALUE="$PROG_NEW"
+    fi
+    [ $TRACE -eq 1 ] && echo "[devin-task] progress after pass $PASS: ${PROG_NEW:-unreadable} (+$PROG_DELTA, $STALLS/$MAX_STALLS stalls)" >&2
+    if [ "$STALLS" -ge "$MAX_STALLS" ]; then
+      echo "devin-task: no progress for $STALLS consecutive pass(es) (--max-stalls $MAX_STALLS); last --progress value $PROG_VALUE. Last check output:" >&2
+      printf '%s\n' "$CHECK_OUT" | tail -20 >&2
+      RC=5; break
+    fi
+  elif [ $PASS -ge "$MAX_PASSES" ]; then
     echo "devin-task: check still failing after --max-passes $MAX_PASSES (exit $CHECK_RC). Last output:" >&2
     printf '%s\n' "$CHECK_OUT" | tail -20 >&2
     RC=5; break
   fi
   SESSION="$(export_field "$EXPORT" session 2>/dev/null || true)"
   PASS=$((PASS+1))
+  if [ -n "$PROGRESS" ]; then
+    PASS_HDR="Pass $PASS."
+    PROG_NOTE=" The progress measure \`$PROGRESS\` now reports $PROG_VALUE (+$PROG_DELTA since the last pass; $STALLS consecutive pass(es) without progress, giving up at $MAX_STALLS)."
+  else
+    PASS_HDR="Pass $PASS of $MAX_PASSES."
+    PROG_NOTE=""
+  fi
   {
     if [ -n "$SESSION" ]; then
-      printf 'Pass %s of %s. The completion check `%s` still fails (exit %s). Its output:\n\n%s\n\nContinue the task until the check passes.' \
-        "$PASS" "$MAX_PASSES" "$UNTIL" "$CHECK_RC" "$(printf '%s\n' "$CHECK_OUT" | tail -40)"
+      printf '%s The completion check `%s` still fails (exit %s).%s Its output:\n\n%s\n\nContinue the task until the check passes.' \
+        "$PASS_HDR" "$UNTIL" "$CHECK_RC" "$PROG_NOTE" "$(printf '%s\n' "$CHECK_OUT" | tail -40)"
     else
-      printf '%s\n\n---\nPass %s of %s. The completion check `%s` still fails (exit %s). Its output:\n\n%s' \
-        "$PROMPT" "$PASS" "$MAX_PASSES" "$UNTIL" "$CHECK_RC" "$(printf '%s\n' "$CHECK_OUT" | tail -40)"
+      printf '%s\n\n---\n%s The completion check `%s` still fails (exit %s).%s Its output:\n\n%s' \
+        "$PROMPT" "$PASS_HDR" "$UNTIL" "$CHECK_RC" "$PROG_NOTE" "$(printf '%s\n' "$CHECK_OUT" | tail -40)"
     fi
   } > "$WORK/prompt.md"
   [ $TRACE -eq 1 ] && echo "[devin-task] check failed (exit $CHECK_RC); starting pass $PASS${SESSION:+ (resuming $SESSION)}" >&2
