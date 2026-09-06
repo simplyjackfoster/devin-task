@@ -53,7 +53,7 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--smart` | passes Devin's `--permission-mode smart` (per Devin's help: "additionally auto-runs actions a fast model judges safe"); still gets the generated read-only allowlist. On this account Devin currently reports it "not available" and falls back to normal (see below) |
 | `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote |
 | `--allow 'Exec(prefix)'` | add a Devin permission rule, repeatable, e.g. `'Exec(python3 -c)'` |
-| `--model M` | default `swe-1-7-medium`; `swe-1-7` and `glm-5-2` are also free at time of writing |
+| `--model M` | default `swe-1-7-medium`; `swe-1-7` and `glm-5-2` are also free at time of writing. Free-ness may be plan-specific: other tooling treats those three as quota-exempt on Pro plans, while a true free-tier account may only reach `swe-1-6-slow`. Run `devin models list` for what's actually free on your account |
 | `--cwd DIR` | run there instead of `cd DIR &&` (which trips Claude Code's cwd-reset warning) |
 | `--timeout S` | per-pass wall clock, default 600; exit 124 and the process tree is killed |
 | `--preamble T` | prepend standing instructions; also `DEVIN_TASK_PREAMBLE` |

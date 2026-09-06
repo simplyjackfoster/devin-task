@@ -103,6 +103,8 @@ models. Each run has its own session, temp prompt and export.
 ## Cost
 
 `swe-1-7-medium`, `swe-1-7` and `glm-5-2` are free on this account. Any other
-`--model` bills Devin credits; `devin models list` shows prices.
+`--model` bills Devin credits; `devin models list` shows prices. Which models
+are free may be plan-specific, so `devin models list` is the source of truth
+for your account, not this doc.
 
 Tests: `bash tests/test_devin_task.sh` (70 stub-devin checks plus two live calls).
