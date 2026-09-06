@@ -80,9 +80,25 @@ Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted
 
 `--retries`, `--backoff`, `--timeout`, `--max-passes`, `--max-concurrent`,
 `--slot-timeout` and `--max-stalls` (and `DEVIN_TASK_RETRY_BASE`) are checked
-before the first pass; a non-integer value
-is a usage error (exit 2). `--backoff` is validated after it overrides
-`DEVIN_TASK_RETRY_BASE`, so a bad env value with a good flag is fine.
+before the first pass; a non-integer value is a usage error (exit 2).
+`--backoff` is validated after it overrides `DEVIN_TASK_RETRY_BASE`, so a bad
+env value with a good flag is fine.
+
+### Observed throughput
+
+One user's measurement on `swe-1-7-medium`, 2026-09-06. Not a guarantee: one
+account on the free tier, one task shape (labelling JSONL rows), and Devin's
+capacity varies by the hour.
+
+| Setup | Throughput | Notes |
+|---|---|---|
+| 1 session | ~100 rows / 8 min | steady, no throttling |
+| 5 concurrent | ~60 rows / 5–8 min **each** | ran clean for an hour |
+| 8 concurrent | — | hard drop-off: throttled on about a third of passes |
+
+`--max-concurrent 5 --backoff 60` were the settings that ran clean. Five is the
+ceiling worth planning around; eight buys nothing, because the retries the
+throttling forces cost more than the extra sessions add.
 
 ### Classifying upstream failures, and `--retries`
 
