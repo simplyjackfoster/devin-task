@@ -236,9 +236,13 @@ permission policy lives here instead of in a generated Devin config.
 
 `--approve` picks that policy:
 
-- `read` (default) allows a command when **every** `&&` / `||` / `;` / `|`
-  segment starts with one of cat head tail sed grep rg wc ls stat file diff
-  jq cut tr uniq pwd which, or `git` with log/status/diff/show.
+- `read` (default) allows a command only if all three hold: nothing anywhere in
+  the string spawns a command or opens a file for writing (no backtick, `$(…)`,
+  `<(…)`, `>(…)` or `>` — `2>&1` and other descriptor duplications are fine);
+  **every** `&&` / `||` / `;` / `|` / `&` separated segment starts with one of
+  cat head tail sed grep rg wc ls stat file diff jq cut tr uniq pwd which, or
+  `git`; and no segment is an in-place `sed` (`-i`, `-i.bak`, `--in-place`) or a
+  `git` outside log/status/diff/show or carrying `--output`.
 - `all` allows everything, `none` cancels everything (a dry run of what Devin
   would reach for).
 
@@ -248,24 +252,28 @@ finishes with `end_turn`.
 
 Other flags mirror the wrapper: `--model`, `--timeout`, `--cwd`,
 `--prompt-file`, `--json`, `--trace`, positional or stdin prompt.
-`--answer-only` is accepted for parity but is a no-op — stdout here is only
-the agent's message. Exit codes: 0 ok, 2 usage, 3 something was denied and the
+`--answer-only` drops the trailing stats line; stdout is only the agent's
+message either way. Exit codes: 0 ok, 2 usage, 3 something was denied and the
 answer came back empty, 124 timeout, 143 signalled, 1 JSON-RPC error.
 
 Not covered yet: no `--edit` equivalent, no `--until` loop, no session resume,
-no `--allow` for extra rules. The policy is a word match, not a shell parser,
-so `cat x > y` slips through where the bash wrapper's Devin-native allowlist
-refuses redirections, and `cd sub && cat f` is denied because `cd` is not on
-the list. Operators inside quotes are not understood either, so
-`grep -E "a|b" f` is denied under `read`; a `shlex(punctuation_chars=True)`
-tokeniser would fix that and redirections both, and is the obvious follow-up.
-The per-segment check exists because on a live run Devin folded two requested
-commands into a single chained one; matching only the first word allowed the
-whole chain.
+no `--allow` for extra rules.
+
+The `read` policy is a word match over the raw string, not a shell parser, and
+it errs towards denying. It refuses every redirection (`>`, `>>`, `&>`), every
+substitution (backtick, `$(…)`, `<(…)`, `>(…)`) and every chaining operator
+that introduces a non-allowlisted command — which also means it refuses
+harmless ones: `cd sub && cat f` is denied because `cd` is not on the list, and
+quoting is not understood, so `grep -E "a|b" f` and `sed -n 's/a;b/c/p' f` are
+denied over the `|` and `;` inside the quotes. A
+`shlex(punctuation_chars=True)` tokeniser would fix the quoting cases and is
+the obvious follow-up. The checks are this blunt because a live run had Devin
+fold two requested commands into a single chained one, and each looser version
+of the rule had a way to smuggle a write past it.
 
 ```bash
 bash tests/test_devin_task_acp.sh
 ```
 
-Thirty-seven checks against a stub `devin` that speaks enough of the protocol.
+Fifty-four checks against a stub `devin` that speaks enough of the protocol.
 No live call in there; the spike's live check is run by hand.
