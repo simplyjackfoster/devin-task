@@ -125,6 +125,22 @@ decide "touch x" all && decide "rm -rf /" all && ok "all allows everything" || f
 decide "cat README.md | head -3" read && ok "read allows a pipe of read-only commands" || fail "read pipe denied"
 ! decide "cat README.md | head -3 && touch /tmp/x" read && ok "read denies a chain ending in touch (live-observed bypass)" || fail "chain allowed"
 ! decide "cd sub && cat f" read && ok "read denies cd chains (cd is not on the list)" || fail "cd chain allowed"
+! decide 'cat README.md & touch /tmp/x' read && ok "read denies background chaining with bare &" || fail "bare & allowed"
+! decide 'cat $(touch /tmp/x) README.md' read && ok "read denies command substitution \$(...)" || fail "\$() allowed"
+! decide 'cat `touch /tmp/x`' read && ok "read denies backtick substitution" || fail "backtick allowed"
+! decide 'cat <(touch /tmp/x)' read && ok "read denies process substitution <(...)" || fail "<() allowed"
+! decide 'tee >(touch /tmp/x)' read && ok "read denies process substitution >(...)" || fail ">() allowed"
+! decide 'cat x > /tmp/y' read && ok "read denies output redirection" || fail "redirection allowed"
+! decide 'cat x >> /tmp/y' read && ok "read denies appending redirection" || fail "append allowed"
+! decide 'cat x &> /tmp/y' read && ok "read denies &> redirection" || fail "&> allowed"
+decide 'cat a 2>&1 | head' read && ok "read allows 2>&1 (a descriptor dup, not a write)" || fail "2>&1 denied"
+decide "sed -n 1p f" read && ok "read allows sed -n" || fail "sed -n denied"
+! decide "sed -i s/a/b/ f" read && ok "read denies sed -i" || fail "sed -i allowed"
+! decide "sed -i.bak s/a/b/ f" read && ok "read denies sed -i.bak" || fail "sed -i.bak allowed"
+! decide "sed --in-place=.bak s/a/b/ f" read && ok "read denies sed --in-place" || fail "sed --in-place allowed"
+decide "git log --oneline" read && ok "read allows git log --oneline" || fail "git log --oneline denied"
+! decide "git diff --output=x" read && ok "read denies git diff --output" || fail "git --output allowed"
+! decide "git log --output FILE" read && ok "read denies git log --output" || fail "git log --output allowed"
 
 echo "trace"
 reset; "$SCRIPT" --trace --approve all "head f" 2>"$TMP/err" >/dev/null
@@ -132,6 +148,8 @@ grep -q "tool: Shell: head f" "$TMP/err" && ok "--trace prints tool call titles"
 grep -q "allow: head f" "$TMP/err" && ok "--trace prints permission decisions" || fail "trace decision" "$(cat "$TMP/err")"
 reset; "$SCRIPT" --approve all "head f" 2>"$TMP/err" >/dev/null
 grep -q "stop=end_turn" "$TMP/err" && grep -q "toolCalls=1" "$TMP/err" && ok "stats and usage line on stderr after the run" || fail "stats line" "$(cat "$TMP/err")"
+reset; out="$("$SCRIPT" --answer-only --approve all "head f" 2>"$TMP/err")"
+[ "$out" = "ALLOWED and ran head f" ] && ! grep -q "stop=" "$TMP/err" && ok "--answer-only drops the stats line" || fail "--answer-only" "out=$out err=$(cat "$TMP/err")"
 
 echo "--json"
 reset; out="$("$SCRIPT" --json --approve none "head f" 2>/dev/null)"; rc=$?

@@ -16,7 +16,7 @@ Flags:
   --cwd DIR                session working directory
   --timeout SECS           whole-run wall clock, default 600; exit 124 on timeout
   --prompt-file FILE       read the prompt from FILE
-  --answer-only            accepted for parity; stdout is always just the answer
+  --answer-only            drop the trailing stats line; stdout is only the answer
   --json                   print {answer, session_id, stop_reason, usage, stats,
                            denied, exit_code} instead of the plain answer
   --trace                  tool calls and permission decisions to stderr, live
@@ -54,31 +54,56 @@ READ_COMMANDS = {
     "diff", "jq", "cut", "tr", "uniq", "pwd", "which", "git",
 }
 GIT_SUBCOMMANDS = {"log", "status", "diff", "show"}
-SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
+# `2>&1` and friends duplicate a descriptor and write nothing, so they are
+# removed before the redirection check rather than denied by it.
+FD_DUP = re.compile(r"\d*>&\d*")
+# Anything that starts another command or opens a file for writing.
+FORBIDDEN = ("`", "$(", "<(", ">(", ">")
+SEGMENTS = re.compile(r"&&|\|\||[;|\n&]")
 
 
 def _segment_ok(segment):
     words = segment.split()
     if not words:
         return False
-    if words[0] == "git":
-        return len(words) > 1 and words[1] in GIT_SUBCOMMANDS
-    return words[0] in READ_COMMANDS
+    name, args = words[0], words[1:]
+    if name not in READ_COMMANDS:
+        return False
+    if name == "sed":  # -i / -i.bak / --in-place edit the file in place
+        return not any(a.startswith("-i") or a.startswith("--in-place") for a in args)
+    if name == "git":  # only reporting subcommands, and --output writes a file
+        if not args or args[0] not in GIT_SUBCOMMANDS:
+            return False
+        return not any(a.startswith("--output") for a in args)
+    return True
 
 
 def decide(command, mode):
     """Pure permission policy. True allows the command, False cancels it.
 
-    Under "read" every segment of the command has to start with a read-only
-    command: Devin readily writes `cat x | head -3 && touch y`, and looking at
-    the first word alone would wave that through. Redirections are not parsed,
-    so `cat x > y` still slips past; see the README.
+    Under "read" a command has to survive three checks. Devin writes shell, not
+    single commands: a live run produced `cat README.md | head -3 && touch /tmp/x`,
+    which a first-word match waves through.
+
+    1. Nothing that spawns a command or opens a file for writing anywhere in the
+       string: backtick, $(...), <(...), >(...), or any > that is not part of a
+       descriptor duplication such as 2>&1.
+    2. Every &&, ||, ;, |, newline or & separated segment must start with an
+       allowlisted command.
+    3. Per command: no in-place sed, and git only for log/status/diff/show
+       without --output.
+
+    Quoting is not understood, so `grep -E "a|b" f` is denied too. Over-denying
+    is the safe direction here; see the README.
     """
     if mode == "all":
         return True
     if mode == "none":
         return False
-    segments = [s.strip() for s in SEGMENTS.split(command or "")]
+    text = FD_DUP.sub(" ", command or "")
+    if any(token in text for token in FORBIDDEN):
+        return False
+    segments = [s.strip() for s in SEGMENTS.split(text)]
     segments = [s for s in segments if s]
     return bool(segments) and all(_segment_ok(s) for s in segments)
 
@@ -110,6 +135,7 @@ class AcpClient:
         self._write_lock = threading.Lock()   # main thread and reader both write
         self._pending = {}                    # id -> [Event, result, error]
         self._pending_lock = threading.Lock()
+        self._closed = False                  # set once the child's stdout ends
         self._next_id = 0
         for target in (self._read_loop, self._drain_stderr):
             threading.Thread(target=target, daemon=True).start()
@@ -129,6 +155,8 @@ class AcpClient:
 
     def request(self, method, params, deadline):
         with self._pending_lock:
+            if self._closed:
+                raise RpcError("devin acp is no longer running")
             self._next_id += 1
             rid = self._next_id
             slot = [threading.Event(), None, None]
@@ -174,6 +202,7 @@ class AcpClient:
             pass
         finally:  # EOF: nothing else will ever answer, so fail everything in flight
             with self._pending_lock:
+                self._closed = True
                 stranded, self._pending = list(self._pending.values()), {}
             for slot in stranded:
                 slot[2] = "devin acp exited before answering"
@@ -345,6 +374,8 @@ def main(argv):
         if text and not text.endswith("\n"):
             sys.stdout.write("\n")
             sys.stdout.flush()
+        if args.answer_only:
+            return rc
         scalars = lambda d: [(k, v) for k, v in d.items()
                              if isinstance(v, (str, int, float, bool))]
         summary = ["stop=%s" % (stop_reason or "none")]
