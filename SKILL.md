@@ -20,6 +20,7 @@ devin-task --yolo --until 'python3 check.py' --max-passes 12 "prompt"   # loop u
 devin-task --inherit-env --yolo "prompt"              # tell Devin which python3/node to use
 devin-task --trace "prompt"                           # heartbeat on stderr + tool-call list after
 devin-task --retries 2 "prompt"                       # retry capacity/rate-limit failures (exit 6)
+devin-task --no-empty-retry "prompt"                  # skip the empty-turn nudge; still exit 9
 ```
 
 From the Bash tool pass `timeout: 600000` or use `run_in_background: true`;
@@ -88,7 +89,11 @@ models. Each run has its own session, temp prompt and export.
 - Exit 8: authentication failure (bad/expired credentials). Run `devin auth status`;
   a refused action (exit 3) is not this — internal-error text inside a
   401/403-looking message is classified as exit 7, not 8.
-- Empty stdout with exit 0 should not happen; check stderr.
+- Exit 9: empty turn persisted after a nudge. On `swe-1-7*` models a pass can
+  exit 0 with no agent message and no tool call (a known upstream failure).
+  The wrapper resumes the session once with a fixed nudge prompt; if still
+  empty, it exits 9. `--no-empty-retry` skips the resume and exits 9 right
+  away. Neither counts against `--max-passes` or `--retries`.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -99,4 +104,4 @@ models. Each run has its own session, temp prompt and export.
 `swe-1-7-medium`, `swe-1-7` and `glm-5-2` are free on this account. Any other
 `--model` bills Devin credits; `devin models list` shows prices.
 
-Tests: `bash tests/test_devin_task.sh` (stub devin plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (65 stub-devin checks plus two live calls).

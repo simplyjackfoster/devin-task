@@ -60,13 +60,14 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--until CMD` | after each pass run `bash -c CMD`; exit 0 ends the loop, otherwise resume the session with the check output |
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted |
 | `--retries N` | retry capacity/rate-limit failures (exit 6) only, default 1; sleeps `5 × attempt` seconds between attempts, overridable via `DEVIN_TASK_RETRY_BASE` |
+| `--no-empty-retry` | don't nudge-resume an empty turn (below) once; detection still runs and still exits 9 |
 | `--answer-only` | print only Devin's final message |
-| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is |
+| `--json` | print `{answer, session_id, exit_code, passes, tool_calls, metrics}`; on a resumed `--until` run `tool_calls` is cumulative across passes, as Devin's export is; `passes` counts only `--until` passes — a nudge pass (below) is never counted |
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
 6 capacity or rate limit (retryable), 7 upstream internal error,
-8 authentication failure, 124 timeout.
+8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout.
 
 ### Classifying upstream failures, and `--retries`
 
@@ -91,6 +92,33 @@ seconds between attempts (5s, then 10s, ...) before re-running the same
 pass — a fresh pass, not a session resume, though a pass already resumed
 under `--until` stays resumed. Set `DEVIN_TASK_RETRY_BASE` to change the
 5-second base (tests use `0`).
+
+### Empty turns and `--no-empty-retry`
+
+On `swe-1-7*` models, a pass sometimes exits 0 having spent the whole turn in
+reasoning and emitted nothing: no `agent` step has a non-empty message, and no
+step has any tool call. The wrapper checks for this after every pass (before
+the `--until` check, so it runs on `--until` passes too) and, on detection,
+resumes the same session once (`-r SESSION_ID`) with exactly:
+
+> Your previous turn produced no message and no tool call. Continue the task
+> now and finish with a written answer.
+
+If the resumed pass is still empty, the wrapper exits 9 with a stderr line.
+If the export is missing or unparseable, the check does nothing — it is not
+treated as empty. `--no-empty-retry` skips the resume; detection still runs,
+so an empty turn still exits 9, just after one call instead of two. A nudge
+pass is never counted in `--json`'s `passes` and never counts against
+`--max-passes`. This is separate from `--retries`: empty turns are not
+retried by `--retries`, they get their own single nudge.
+
+Caveat: Devin's export is cumulative across a resumed session (see the
+`--json` row above), so once `--until` has resumed a session for its own
+retry loop, later passes carry earlier passes' messages and tool calls in the
+same export — an empty-turn check on pass 3+ of an `--until` run can't
+distinguish "this pass was empty" from "an earlier pass wasn't". In practice
+this rarely matters: `--until`'s own resume prompt already re-engages Devin
+after any pass that made no progress.
 
 ### Read-only shell allowlist
 
@@ -168,11 +196,11 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Fifty-eight checks against a stub `devin` on PATH (argv, generated config and
+Sixty-five checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries`, the
-`--until` loop) plus two live calls on the
-free model.
+`--until` loop, empty-turn detection and `--no-empty-retry`) plus two live
+calls on the free model.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file

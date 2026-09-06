@@ -44,6 +44,19 @@ case "${STUB_MODE:-ok}" in
       [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
     fi
     ;;
+  empty)
+    echo "narrative line"
+    [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    ;;
+  empty_then_ok)
+    if [ "$n" -lt 2 ]; then
+      echo "narrative line"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
 esac
 STUB
 chmod +x "$TMP/bin/devin"
@@ -101,7 +114,7 @@ reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "i
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
 [ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
 out="$("$WRAPPER" --help 2>&1)"; rc=$?
-[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q "124" && ok "--help prints the full header, including --retries and exit code 124" || fail "--help truncated" "rc=$rc out=$out"
+[ $rc -eq 2 ] && echo "$out" | grep -q -- "--retries" && echo "$out" | grep -q -- "--no-empty-retry" && echo "$out" | grep -q "124" && echo "$out" | grep -qE '\b9\b' && ok "--help prints the full header, including --retries, --no-empty-retry, and exit codes 9 and 124" || fail "--help truncated" "rc=$rc out=$out"
 reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
 [ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
 reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
@@ -173,6 +186,20 @@ reset; rm -f "$CHECK_COUNT"; out="$(STUB_MODE=reject "$WRAPPER" --until "$TMP/ch
 [ $rc -eq 3 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "refusal inside --until stops immediately" || fail "until refusal" "rc=$rc"
 reset; rm -f "$CHECK_COUNT"; out="$("$WRAPPER" --until "$TMP/check.sh" --json "label" 2>/dev/null)"
 echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==3' 2>/dev/null && ok "--json reports pass count" || fail "json passes" "$out"
+
+echo "empty-turn detection"
+reset; out="$("$WRAPPER" "say hi" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "normal export -> 1 call, no false-positive nudge" || fail "no false positive" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null)"
+reset; out="$(STUB_MODE=empty_then_ok "$WRAPPER" "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "empty turn then normal -> exit 0, 2 calls" || fail "empty then normal" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+paste -sd' ' "$STUB_ARGV.2" | grep -qF -- "-r stub-sess" && ok "nudge pass resumes the session by id" || fail "nudge resume" "$(cat "$STUB_ARGV.2" 2>/dev/null)"
+grep -qF "Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer." "$STUB_PROMPT.2" && ok "nudge pass prompt file contains the nudge text verbatim" || fail "nudge prompt text" "$(cat "$STUB_PROMPT.2" 2>/dev/null)"
+reset; out="$(STUB_MODE=empty "$WRAPPER" "do the task" 2>&1)"; rc=$?
+[ $rc -eq 9 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "2" ] && ok "empty twice -> exit 9 after exactly 2 calls" || fail "empty twice" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+reset; out="$(STUB_MODE=empty "$WRAPPER" --no-empty-retry "do the task" 2>&1)"; rc=$?
+[ $rc -eq 9 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--no-empty-retry on empty -> exit 9 after 1 call" || fail "--no-empty-retry" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null)"
+reset; out="$(STUB_MODE=empty_then_ok "$WRAPPER" --json "do the task" 2>/dev/null)"
+echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==1, d["passes"]' 2>/dev/null && ok "--json after a nudge reports passes unchanged (nudge not counted)" || fail "json passes after nudge" "$out"
 
 echo "live (real devin, free model)"
 PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG

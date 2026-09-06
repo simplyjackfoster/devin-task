@@ -21,6 +21,7 @@
 #   --retries N          retry capacity/rate-limit failures (exit 6), default 1;
 #                        sleeps 5*attempt seconds between attempts, overridable
 #                        via DEVIN_TASK_RETRY_BASE (seconds)
+#   --no-empty-retry     don't nudge-resume an empty turn once; still exit 9
 # Output:
 #   --answer-only        print only Devin's final message
 #   --json               print {answer, session_id, exit_code, passes, tool_calls}
@@ -30,15 +31,23 @@
 # internal error, auth, rate limit); the refusal check above keeps precedence over
 # this classification.
 #
+# An "empty turn" (a pass that exits 0 with no agent message and no tool call) is
+# a known upstream failure on swe-1-7* models. The wrapper resumes the session
+# once with a fixed nudge prompt; if still empty, it exits 9. A nudge pass never
+# counts against --max-passes.
+#
 # Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted,
 #             6 capacity or rate limit (retryable), 7 upstream internal error,
-#             8 authentication failure, 124 timeout.
+#             8 authentication failure, 9 empty turn persisted after nudge,
+#             124 timeout.
 set -u
 
 MODEL="swe-1-7-medium"; PERM="auto"; TIMEOUT=600; CWD=""
 PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
 ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
 RETRIES=1; RETRY_BASE="${DEVIN_TASK_RETRY_BASE:-5}"
+NO_EMPTY_RETRY=0
+NUDGE_PROMPT='Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer.'
 ALLOW_EXTRA=()
 HEARTBEAT="${DEVIN_TASK_HEARTBEAT:-30}"
 USER_CONFIG="${DEVIN_TASK_USER_CONFIG:-$HOME/.config/devin/config.json}"
@@ -56,7 +65,7 @@ kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL straggl
   local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
   kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
 }
-usage() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
 
 # ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
@@ -92,6 +101,7 @@ while [ $# -gt 0 ]; do
     --until)       UNTIL="$2"; shift 2 ;;
     --max-passes)  MAX_PASSES="$2"; shift 2 ;;
     --retries)     RETRIES="$2"; shift 2 ;;
+    --no-empty-retry) NO_EMPTY_RETRY=1; shift ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --answer-only) ANSWER_ONLY=1; shift ;;
     --json)        JSON=1; shift ;;
@@ -217,6 +227,24 @@ elif what == "tools":
 PY
 }
 
+# ---- true (exit 0) if EXPORT is a parseable export with no agent message and
+# no tool_calls anywhere; false (exit 1) if not empty, missing, or unparseable
+# (missing/unparseable is "do nothing", not "empty") ----
+is_empty_turn() {  # $1 export-file
+  [ $HAVE_PY -eq 1 ] && [ -s "$1" ] || return 1
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+steps = d.get("steps", [])
+has_msg = any(s.get("source") == "agent" and (s.get("message") or "").strip() for s in steps)
+has_tools = any(s.get("tool_calls") for s in steps)
+sys.exit(0 if not has_msg and not has_tools else 1)
+PY
+}
+
 # ---- main loop ----
 PASS=1; SESSION=""; EXPORT="$WORK/export.json"
 CAPTURE=""; [ $ANSWER_ONLY -eq 1 ] || [ $JSON -eq 1 ] && CAPTURE="$WORK/stdout"
@@ -236,6 +264,27 @@ while :; do
     [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
   done
   [ $RC -ne 0 ] && break
+  if is_empty_turn "$EXPORT"; then
+    if [ $NO_EMPTY_RETRY -eq 1 ]; then
+      echo "devin-task: pass produced no message and no tool call (empty turn); --no-empty-retry set, not resuming; exit 9" >&2
+      RC=9; break
+    fi
+    NUDGE_SID="$(export_field "$EXPORT" session 2>/dev/null || true)"
+    if [ -z "$NUDGE_SID" ]; then
+      echo "devin-task: pass produced no message and no tool call (empty turn), and no session id to resume; exit 9" >&2
+      RC=9; break
+    fi
+    echo "devin-task: pass produced no message and no tool call (empty turn); resuming session once with a nudge" >&2
+    printf '%s' "$NUDGE_PROMPT" > "$WORK/nudge.md"
+    rm -f "$EXPORT"
+    run_pass "$WORK/nudge.md" "$EXPORT" "$NUDGE_SID" "$CAPTURE"
+    [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] nudge pass tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
+    [ $RC -ne 0 ] && break
+    if is_empty_turn "$EXPORT"; then
+      echo "devin-task: resumed pass still produced no message and no tool call; exit 9" >&2
+      RC=9; break
+    fi
+  fi
   [ -z "$UNTIL" ] && break
   CHECK_OUT="$(bash -c "$UNTIL" 2>&1)"; CHECK_RC=$?
   if [ $CHECK_RC -eq 0 ]; then
