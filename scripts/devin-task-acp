@@ -28,6 +28,7 @@ Exit codes: 0 ok, 2 usage, 3 something was denied and the answer is empty,
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -46,26 +47,40 @@ INITIALIZE_PARAMS = {
 }
 EDITABLE_COMMAND = "cognition.ai/editableCommand"
 
-# Commands that cannot write a file by themselves, matched on the first word only.
+# Commands that cannot write a file by themselves, matched on the first word of
+# every segment of the command (Devin chains work with && and | freely).
 READ_COMMANDS = {
     "cat", "head", "tail", "sed", "grep", "rg", "wc", "ls", "stat", "file",
     "diff", "jq", "cut", "tr", "uniq", "pwd", "which", "git",
 }
 GIT_SUBCOMMANDS = {"log", "status", "diff", "show"}
+SEGMENTS = re.compile(r"&&|\|\||[;|\n]")
 
 
-def decide(command, mode):
-    """Pure permission policy. True allows the command, False cancels it."""
-    if mode == "all":
-        return True
-    if mode == "none":
-        return False
-    words = (command or "").split()
+def _segment_ok(segment):
+    words = segment.split()
     if not words:
         return False
     if words[0] == "git":
         return len(words) > 1 and words[1] in GIT_SUBCOMMANDS
     return words[0] in READ_COMMANDS
+
+
+def decide(command, mode):
+    """Pure permission policy. True allows the command, False cancels it.
+
+    Under "read" every segment of the command has to start with a read-only
+    command: Devin readily writes `cat x | head -3 && touch y`, and looking at
+    the first word alone would wave that through. Redirections are not parsed,
+    so `cat x > y` still slips past; see the README.
+    """
+    if mode == "all":
+        return True
+    if mode == "none":
+        return False
+    segments = [s.strip() for s in SEGMENTS.split(command or "")]
+    segments = [s for s in segments if s]
+    return bool(segments) and all(_segment_ok(s) for s in segments)
 
 
 class RpcError(Exception):
@@ -229,7 +244,8 @@ def main(argv):
 
     prompt = read_prompt(args, warn)
     if prompt is None or not prompt.strip():
-        warn("no prompt given (positional, --prompt-file or stdin)")
+        if not args.prompt_file:
+            warn("no prompt given (positional, --prompt-file or stdin)")
         return 2
     cwd = os.path.abspath(args.cwd or os.getcwd())
     if not os.path.isdir(cwd):
@@ -329,9 +345,11 @@ def main(argv):
         if text and not text.endswith("\n"):
             sys.stdout.write("\n")
             sys.stdout.flush()
+        scalars = lambda d: [(k, v) for k, v in d.items()
+                             if isinstance(v, (str, int, float, bool))]
         summary = ["stop=%s" % (stop_reason or "none")]
-        summary += ["%s=%s" % (k, v) for k, v in stats.items()]
-        summary += ["%s=%s" % (k, v) for k, v in usage.items() if k not in stats]
+        summary += ["%s=%s" % kv for kv in scalars(stats)]
+        summary += ["%s=%s" % kv for kv in scalars(usage) if kv[0] not in stats]
         if denied:
             summary.append("denied=%d" % len(denied))
         print("[acp] %s" % " ".join(summary), file=sys.stderr)

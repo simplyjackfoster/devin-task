@@ -43,6 +43,12 @@ while True:
     elif method == "session/new":
         with open(os.environ["STUB_CWD"], "w") as f:
             f.write(msg["params"]["cwd"] + "\n")
+        if mode == "crash":
+            sys.exit(1)                # die mid-request: the client sees EOF
+        if mode == "error":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "error": {"code": -32000, "message": "stub refused the session"}})
+            continue
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "stub-sess"}})
     elif method == "session/prompt":
         cmd = msg["params"]["prompt"][0]["text"].strip()
@@ -81,7 +87,7 @@ reset() { rm -f "$STUB_ARGV" "$STUB_CWD"; STUB_MODE=ok; }
 
 # decide() called directly, as the pure function it is
 decide() {
-  python3 -c '
+  PYTHONDONTWRITEBYTECODE=1 python3 -c '
 import importlib.util, sys
 from importlib.machinery import SourceFileLoader
 spec = importlib.util.spec_from_loader("acp", SourceFileLoader("acp", sys.argv[1]))
@@ -116,6 +122,9 @@ decide "git status" read && ok "read allows git status" || fail "git status deni
 ! decide "head x" none && ! decide "git status" none && ok "none denies everything" || fail "none too permissive"
 decide "touch x" all && decide "rm -rf /" all && ok "all allows everything" || fail "all too strict"
 ! decide "" read && ok "empty command denied under read" || fail "empty command allowed"
+decide "cat README.md | head -3" read && ok "read allows a pipe of read-only commands" || fail "read pipe denied"
+! decide "cat README.md | head -3 && touch /tmp/x" read && ok "read denies a chain ending in touch (live-observed bypass)" || fail "chain allowed"
+! decide "cd sub && cat f" read && ok "read denies cd chains (cd is not on the list)" || fail "cd chain allowed"
 
 echo "trace"
 reset; "$SCRIPT" --trace --approve all "head f" 2>"$TMP/err" >/dev/null
@@ -150,6 +159,15 @@ out="$("$SCRIPT" --approve all 2>&1 </dev/null)"; rc=$?
 [ $rc -eq 2 ] && echo "$out" | grep -qi "prompt" && ok "no prompt -> exit 2" || fail "empty prompt" "rc=$rc $out"
 out="$("$SCRIPT" --approve bogus "x" 2>&1)"; rc=$?
 [ $rc -eq 2 ] && ok "bad --approve value -> exit 2" || fail "bad approve" "rc=$rc $out"
+
+echo "transport failures"
+reset; STUB_MODE=error; out="$("$SCRIPT" "head f" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "stub refused the session" && ok "JSON-RPC error -> exit 1, message on stderr" || fail "rpc error" "rc=$rc $out"
+reset; STUB_MODE=crash; start=$(date +%s)
+out="$("$SCRIPT" --timeout 30 "head f" 2>&1)"; rc=$?
+[ $rc -eq 1 ] && [ $(( $(date +%s) - start )) -le 5 ] && ok "devin exiting mid-request -> exit 1 at once, not at the timeout" || fail "eof handling" "rc=$rc $out"
+reset; out="$("$SCRIPT" --prompt-file "$TMP/missing.md" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "cannot read --prompt-file" && ok "unreadable --prompt-file -> exit 2" || fail "prompt-file missing" "rc=$rc $out"
 
 echo "timeout and signals"
 reset; STUB_MODE=hang; start=$(date +%s)
