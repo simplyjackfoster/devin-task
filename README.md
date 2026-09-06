@@ -243,10 +243,12 @@ permission policy lives here instead of in a generated Devin config.
 
 - `read` (default) allows a command only if all three hold: nothing anywhere in
   the string spawns a command or opens a file for writing (no backtick, `$(…)`,
-  `<(…)`, `>(…)` or `>` — `2>&1` and other descriptor duplications are fine);
-  **every** `&&` / `||` / `;` / `|` / `&` separated segment starts with one of
+  `<(…)`, `>(…)` or `>` — only a true descriptor duplication, `2>&1`, `>&2` or
+  `>&-`, is exempt; `>&file` is a redirect and is denied); **every** `&&` /
+  `||` / `;` / `|` / `&` separated segment starts with one of
   cat head tail sed grep rg wc ls stat file diff jq cut tr uniq pwd which, or
-  `git`; and no segment is an in-place `sed` (`-i`, `-i.bak`, `--in-place`) or a
+  `git`; and no segment is an in-place `sed` (`-i`, `-i.bak`, `-I`,
+  `--in-place`, or a bundled cluster such as `-ni.bak`) or a
   `git` outside log/status/diff/show or carrying `--output`.
 - `all` allows everything, `none` cancels everything (a dry run of what Devin
   would reach for).
@@ -280,5 +282,5 @@ of the rule had a way to smuggle a write past it.
 bash tests/test_devin_task_acp.sh
 ```
 
-Fifty-four checks against a stub `devin` that speaks enough of the protocol.
+Sixty-three checks against a stub `devin` that speaks enough of the protocol.
 No live call in there; the spike's live check is run by hand.

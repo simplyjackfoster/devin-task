@@ -55,8 +55,10 @@ READ_COMMANDS = {
 }
 GIT_SUBCOMMANDS = {"log", "status", "diff", "show"}
 # `2>&1` and friends duplicate a descriptor and write nothing, so they are
-# removed before the redirection check rather than denied by it.
-FD_DUP = re.compile(r"\d*>&\d*")
+# removed before the redirection check rather than denied by it. Only a real
+# duplication counts: `>&N` and `>&-`. Bash reads `>&word` (anything else) as a
+# plain file redirect, so `cat src >& victim` must keep its `>` and be denied.
+FD_DUP = re.compile(r"\d*>&(?:\d+|-)(?![\w./-])")
 # Anything that starts another command or opens a file for writing.
 FORBIDDEN = ("`", "$(", "<(", ">(", ">")
 SEGMENTS = re.compile(r"&&|\|\||[;|\n&]")
@@ -69,8 +71,11 @@ def _segment_ok(segment):
     name, args = words[0], words[1:]
     if name not in READ_COMMANDS:
         return False
-    if name == "sed":  # -i / -i.bak / --in-place edit the file in place
-        return not any(a.startswith("-i") or a.startswith("--in-place") for a in args)
+    if name == "sed":
+        # -i / -i.bak / -I / --in-place edit the file in place, and a bundled
+        # cluster such as -ni.bak hides the flag from a plain prefix test
+        return not any(re.match(r"^-[^-]*[iI]", a) or a.startswith("--in-place")
+                       for a in args)
     if name == "git":  # only reporting subcommands, and --output writes a file
         if not args or args[0] not in GIT_SUBCOMMANDS:
             return False
@@ -90,8 +95,8 @@ def decide(command, mode):
        descriptor duplication such as 2>&1.
     2. Every &&, ||, ;, |, newline or & separated segment must start with an
        allowlisted command.
-    3. Per command: no in-place sed, and git only for log/status/diff/show
-       without --output.
+    3. Per command: no in-place sed (including a bundled cluster like -ni.bak),
+       and git only for log/status/diff/show without --output.
 
     Quoting is not understood, so `grep -E "a|b" f` is denied too. Over-denying
     is the safe direction here; see the README.
