@@ -7,6 +7,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 command -v devin >/dev/null || {
   echo "devin CLI not found on PATH. Install it first: https://docs.devin.ai/cli" >&2; exit 1; }
 
+echo "preflight:"
+if ! devin --version; then
+  echo "devin --version failed. Reinstall the Devin CLI: https://docs.devin.ai/cli" >&2
+  exit 1
+fi
+if ! devin doctor; then
+  echo "devin doctor reported a failure (see above). Run 'devin auth login', then re-run ./install.sh." >&2
+  exit 1
+fi
+
 mkdir -p ~/.claude/skills ~/.local/bin
 if [ -e ~/.claude/skills/devin ] && [ ! -L ~/.claude/skills/devin ]; then
   echo "~/.claude/skills/devin exists and is not a symlink; move it aside first." >&2; exit 1
@@ -19,15 +29,5 @@ echo "linked  ~/.claude/skills/devin -> $HERE"
 echo "linked  ~/.local/bin/devin-task -> $HERE/scripts/devin-task"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: add ~/.local/bin to PATH" ;; esac
 echo "free models on this account:"; devin models list 2>/dev/null | grep -F 'Free' || echo "  (none listed; check 'devin models list')"
-
-echo "preflight:"
-if ! devin --version; then
-  echo "devin --version failed. Reinstall the Devin CLI: https://docs.devin.ai/cli" >&2
-  exit 1
-fi
-if ! devin doctor; then
-  echo "devin doctor reported a failure (see above). Run 'devin auth login', then re-run ./install.sh." >&2
-  exit 1
-fi
 
 echo "smoke test:"; ~/.local/bin/devin-task --timeout 60 "Reply with exactly the word PONG."

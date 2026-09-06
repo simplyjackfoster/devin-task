@@ -94,7 +94,14 @@ models. Each run has its own session, temp prompt and export.
   exit 0 with no agent message and no tool call (a known upstream failure).
   The wrapper resumes the session once with a fixed nudge prompt; if still
   empty, it exits 9. `--no-empty-retry` skips the resume and exits 9 right
-  away. Neither counts against `--max-passes` or `--retries`.
+  away. A nudge pass never counts against `--max-passes` or `--json`'s
+  `passes`, and an empty turn is not itself retried by `--retries`. A capacity
+  or rate-limit failure during the nudge is retried under `--retries` like any
+  other pass, and does consume the retry budget.
+- Exit 143: the wrapper itself was killed by SIGTERM or SIGINT. It kills
+  Devin's process tree on the way out, so nothing is left running.
+- Exit 2 also covers a non-integer `--retries`, `--timeout`, `--max-passes` or
+  `DEVIN_TASK_RETRY_BASE`; these are checked before the first pass.
 - `--trace` cannot stream Devin's tool calls live: print mode writes the
   conversation export only at the end and Devin's logs carry no tool calls. The
   heartbeat shows elapsed time and bytes of output so far; the tool-call list
@@ -107,4 +114,4 @@ models. Each run has its own session, temp prompt and export.
 are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
-Tests: `bash tests/test_devin_task.sh` (70 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (77 stub-devin checks plus two live calls).

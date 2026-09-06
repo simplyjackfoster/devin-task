@@ -68,7 +68,11 @@ printf '%s' "$PROMPT" | devin-task [flags]
 
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted,
 6 capacity or rate limit (retryable), 7 upstream internal error,
-8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout.
+8 authentication failure, 9 empty turn persisted after a nudge, 124 timeout,
+143 the wrapper was killed by SIGTERM or SIGINT.
+
+`--retries`, `--timeout` and `--max-passes` (and `DEVIN_TASK_RETRY_BASE`) are
+checked before the first pass; a non-integer value is a usage error (exit 2).
 
 ### Classifying upstream failures, and `--retries`
 
@@ -110,8 +114,10 @@ If the export is missing or unparseable, the check does nothing — it is not
 treated as empty. `--no-empty-retry` skips the resume; detection still runs,
 so an empty turn still exits 9, just after one call instead of two. A nudge
 pass is never counted in `--json`'s `passes` and never counts against
-`--max-passes`. This is separate from `--retries`: empty turns are not
-retried by `--retries`, they get their own single nudge.
+`--max-passes`. An empty turn itself is not a `--retries` condition: it gets
+its own single nudge. The nudge pass is otherwise an ordinary pass, so if it
+fails with capacity or rate-limit text it is retried under `--retries` like
+any other pass, and those attempts do consume the retry budget.
 
 Devin's export is cumulative across a resumed session (see the `--json` row
 above), so the check only looks at the steps the current pass actually added
@@ -196,16 +202,16 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Seventy checks against a stub `devin` on PATH (argv, generated config and
+Seventy-seven checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
-timeout, signal propagation, failure classification, `--retries`, the
-`--until` loop, empty-turn detection and `--no-empty-retry`, including a
-cumulative-export case where a later `--until` pass adds only empty steps,
-a non-object export, and a capacity failure retried during the nudge)
-plus two live calls on the free model. Set `DEVIN_TASK_TEST_NO_LIVE=1` to skip
-the two live calls (prints `live: skipped` instead); CI runs both this suite
-and `tests/test_devin_task_acp.sh` with that var set on every push and pull
-request.
+timeout, signal propagation, failure classification, `--retries`, integer
+validation of the numeric flags, the `--until` loop, empty-turn detection and
+`--no-empty-retry`, including a cumulative-export case where a later `--until`
+pass adds only empty steps, a non-object export, and a capacity failure
+retried during the nudge) plus two live calls on the free model. Set
+`DEVIN_TASK_TEST_NO_LIVE=1` to skip the two live calls (prints `live: skipped`
+instead). CI runs this suite with that var set, and the ACP suite, which makes
+no live calls, as it is, on every push and pull request.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file
