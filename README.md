@@ -112,13 +112,12 @@ pass is never counted in `--json`'s `passes` and never counts against
 `--max-passes`. This is separate from `--retries`: empty turns are not
 retried by `--retries`, they get their own single nudge.
 
-Caveat: Devin's export is cumulative across a resumed session (see the
-`--json` row above), so once `--until` has resumed a session for its own
-retry loop, later passes carry earlier passes' messages and tool calls in the
-same export — an empty-turn check on pass 3+ of an `--until` run can't
-distinguish "this pass was empty" from "an earlier pass wasn't". In practice
-this rarely matters: `--until`'s own resume prompt already re-engages Devin
-after any pass that made no progress.
+Devin's export is cumulative across a resumed session (see the `--json` row
+above), so the check only looks at the steps the current pass actually added
+since the last one — the step count before the pass, remembered across
+resumes — rather than the whole export, so an empty pass is still caught on
+pass 3+ of an `--until` run even though earlier passes' content is still in
+the same export.
 
 ### Read-only shell allowlist
 
@@ -196,11 +195,12 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Sixty-five checks against a stub `devin` on PATH (argv, generated config and
+Sixty-six checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries`, the
-`--until` loop, empty-turn detection and `--no-empty-retry`) plus two live
-calls on the free model.
+`--until` loop, empty-turn detection and `--no-empty-retry`, including a
+cumulative-export case where a later `--until` pass adds only empty steps)
+plus two live calls on the free model.
 
 If you edit `scripts/devin-task` while a run is in flight, write to a temp
 file and `mv` it over: bash reads scripts incrementally, so rewriting the file

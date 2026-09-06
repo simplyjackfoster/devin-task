@@ -28,7 +28,16 @@ done
 case "${STUB_MODE:-ok}" in
   ok)
     echo "narrative line"; echo "STUB-OK"
-    [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\",\"tool_calls\":[{\"function_name\":\"exec\",\"arguments\":{\"command\":\"wc -l f.txt\"}}]},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{\"total_steps\":3}}" > "$EXPORT" ;;
+    if [ -n "$EXPORT" ]; then
+      # cumulative like a real resumed-session export: on call n the first two
+      # steps stay fixed and n copies of the final-message step are appended,
+      # so a multi-call --until run genuinely grows the export each pass.
+      final="{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}"
+      steps="{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\",\"tool_calls\":[{\"function_name\":\"exec\",\"arguments\":{\"command\":\"wc -l f.txt\"}}]}"
+      i=1; while [ "$i" -le "$n" ]; do steps="$steps,$final"; i=$((i+1)); done
+      printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[$steps],\"final_metrics\":{\"total_steps\":$((2+n))}}" > "$EXPORT"
+    fi
+    ;;
   reject) echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2; exit 0 ;;
   hang)   sleep 30; echo "never" ;;
   capacity)  echo "Error: the servers are currently overloaded, please try again later" >&2; exit 1 ;;
@@ -54,7 +63,23 @@ case "${STUB_MODE:-ok}" in
       [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
     else
       echo "narrative line"; echo "STUB-OK"
-      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
+    fi
+    ;;
+  until_empty_pass2)
+    # cumulative export across a 3-call --until run: call 1 is a normal
+    # pass with a real message; call 2 (the --until resume) appends only an
+    # empty step (no message, no tool_calls) on top of call 1's content;
+    # call 3 (the nudge resume) appends a real final message.
+    if [ "$n" -eq 1 ]; then
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"}],\"final_metrics\":{}}" > "$EXPORT"
+    elif [ "$n" -eq 2 ]; then
+      echo "narrative line"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"},{\"source\":\"agent\",\"message\":\"\"}],\"final_metrics\":{}}" > "$EXPORT"
+    else
+      echo "narrative line"; echo "STUB-OK"
+      [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"agent\",\"message\":\"working on it\"},{\"source\":\"agent\",\"message\":\"\"},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{}}" > "$EXPORT"
     fi
     ;;
 esac
@@ -200,6 +225,18 @@ reset; out="$(STUB_MODE=empty "$WRAPPER" --no-empty-retry "do the task" 2>&1)"; 
 [ $rc -eq 9 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "--no-empty-retry on empty -> exit 9 after 1 call" || fail "--no-empty-retry" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null)"
 reset; out="$(STUB_MODE=empty_then_ok "$WRAPPER" --json "do the task" 2>/dev/null)"
 echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==1, d["passes"]' 2>/dev/null && ok "--json after a nudge reports passes unchanged (nudge not counted)" || fail "json passes after nudge" "$out"
+
+echo "empty-turn detection uses only the current pass's steps (cumulative export)"
+cat > "$TMP/check2.sh" <<'CHK2'
+#!/usr/bin/env bash
+n=$(cat "$CHECK2_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CHECK2_COUNT"
+echo "check call $n"; [ "$n" -ge 2 ]
+CHK2
+chmod +x "$TMP/check2.sh"; export CHECK2_COUNT="$TMP/count2"
+reset; rm -f "$CHECK2_COUNT"; out="$(STUB_MODE=until_empty_pass2 "$WRAPPER" --until "$TMP/check2.sh" --max-passes 5 "do the task" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "an --until resume that appends only empty steps still triggers the nudge (3 calls), then exits 0" || fail "cumulative-export offset fix" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null) $out"
+paste -sd' ' "$STUB_ARGV.3" | grep -qF -- "-r stub-sess" && ok "the nudge (call 3) resumes the session by id" || fail "cumulative nudge resume" "$(cat "$STUB_ARGV.3" 2>/dev/null)"
+grep -qF "Your previous turn produced no message and no tool call. Continue the task now and finish with a written answer." "$STUB_PROMPT.3" && ok "the nudge (call 3) prompt file contains the nudge text verbatim" || fail "cumulative nudge prompt" "$(cat "$STUB_PROMPT.3" 2>/dev/null)"
 
 echo "live (real devin, free model)"
 PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG

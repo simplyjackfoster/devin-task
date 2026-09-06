@@ -227,20 +227,45 @@ elif what == "tools":
 PY
 }
 
-# ---- true (exit 0) if EXPORT is a parseable export with no agent message and
-# no tool_calls anywhere; false (exit 1) if not empty, missing, or unparseable
-# (missing/unparseable is "do nothing", not "empty") ----
-is_empty_turn() {  # $1 export-file
+# ---- number of steps in EXPORT; 0 if no python3, missing, or unparseable ----
+step_count() {  # $1 export-file
+  if [ $HAVE_PY -eq 1 ] && [ -s "$1" ]; then
+    python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(len(d.get("steps", [])))
+except Exception:
+    print(0)
+PY
+  else
+    echo 0
+  fi
+}
+
+# ---- true (exit 0) if, among the steps EXPORT added since $2 (an earlier
+# step count from step_count; 0 for a fresh session), no agent step has a
+# non-empty message and no step has any tool_calls; false (exit 1) if not
+# empty, missing, or unparseable (missing/unparseable is "do nothing", not
+# "empty"). Devin's export on a resumed session is cumulative, so $2 lets
+# the check see only what THIS pass added, not earlier passes' content; if
+# $2 turns out to exceed the step list (export wasn't actually cumulative)
+# it falls back to checking every step. ----
+is_empty_turn() {  # $1 export-file  $2 prior-step-count-or-empty
   [ $HAVE_PY -eq 1 ] && [ -s "$1" ] || return 1
-  python3 - "$1" <<'PY'
+  python3 - "$1" "${2:-0}" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
 steps = d.get("steps", [])
-has_msg = any(s.get("source") == "agent" and (s.get("message") or "").strip() for s in steps)
-has_tools = any(s.get("tool_calls") for s in steps)
+offset = int(sys.argv[2])
+if offset < 0 or offset > len(steps):
+    offset = 0
+new_steps = steps[offset:]
+has_msg = any(s.get("source") == "agent" and (s.get("message") or "").strip() for s in new_steps)
+has_tools = any(s.get("tool_calls") for s in new_steps)
 sys.exit(0 if not has_msg and not has_tools else 1)
 PY
 }
@@ -250,6 +275,7 @@ PASS=1; SESSION=""; EXPORT="$WORK/export.json"
 CAPTURE=""; [ $ANSWER_ONLY -eq 1 ] || [ $JSON -eq 1 ] && CAPTURE="$WORK/stdout"
 printf '%s' "$PROMPT" > "$WORK/prompt.md"
 while :; do
+  PREV_STEPS="$(step_count "$EXPORT")"
   rm -f "$EXPORT"
   run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
   [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
@@ -264,7 +290,7 @@ while :; do
     [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
   done
   [ $RC -ne 0 ] && break
-  if is_empty_turn "$EXPORT"; then
+  if is_empty_turn "$EXPORT" "$PREV_STEPS"; then
     if [ $NO_EMPTY_RETRY -eq 1 ]; then
       echo "devin-task: pass produced no message and no tool call (empty turn); --no-empty-retry set, not resuming; exit 9" >&2
       RC=9; break
@@ -274,13 +300,14 @@ while :; do
       echo "devin-task: pass produced no message and no tool call (empty turn), and no session id to resume; exit 9" >&2
       RC=9; break
     fi
+    NUDGE_PREV_STEPS="$(step_count "$EXPORT")"
     echo "devin-task: pass produced no message and no tool call (empty turn); resuming session once with a nudge" >&2
     printf '%s' "$NUDGE_PROMPT" > "$WORK/nudge.md"
     rm -f "$EXPORT"
     run_pass "$WORK/nudge.md" "$EXPORT" "$NUDGE_SID" "$CAPTURE"
     [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] nudge pass tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
     [ $RC -ne 0 ] && break
-    if is_empty_turn "$EXPORT"; then
+    if is_empty_turn "$EXPORT" "$NUDGE_PREV_STEPS"; then
       echo "devin-task: resumed pass still produced no message and no tool call; exit 9" >&2
       RC=9; break
     fi
