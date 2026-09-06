@@ -2,74 +2,250 @@
 # devin-task: run a one-shot task through the local Devin CLI on the free SWE-1.7 model.
 #
 # Usage:
-#   devin-task [--edit | --yolo] [--model M] [--timeout SECS] "prompt"
-#   echo "long prompt" | devin-task [flags]
+#   devin-task [flags] "prompt"
+#   devin-task [flags] --prompt-file FILE
+#   printf '%s' "$PROMPT" | devin-task [flags]
 #
-# Default is read-only (Devin may read files and run read-only commands).
-#   --edit     also allow file edits in the workspace   (accept-edits)
-#   --yolo     auto-approve everything, incl. commands  (dangerous)
-#   --model M  override model (default swe-1-7-medium, free)
-#   --timeout  seconds before the run is killed (default 600)
+# Permission (default is read-only: file tools plus a read-only shell allowlist):
+#   --edit               also allow file edits in the workspace      (accept-edits)
+#   --yolo               auto-approve everything, incl. any command  (dangerous)
+#   --allow 'Exec(cmd)'  add a Devin permission rule (repeatable), e.g. 'Exec(python3 -c)'
+# Run:
+#   --model M            override model (default swe-1-7-medium, free)
+#   --cwd DIR            run in DIR (also where --until's check runs)
+#   --timeout SECS       per-pass wall clock, default 600; exit 124 on timeout
+#   --preamble TEXT      prepend TEXT to the prompt (env: DEVIN_TASK_PREAMBLE)
+#   --inherit-env        prepend the caller's python3/node paths and CONDA_PREFIX
+#   --until CMD          rerun (resuming the session) until `bash -c CMD` exits 0
+#   --max-passes N       cap for --until, default 5; exit 5 when exhausted
+# Output:
+#   --answer-only        print only Devin's final message
+#   --json               print {answer, session_id, exit_code, passes, tool_calls}
+#   --trace              heartbeat to stderr while running; tool-call list after
+#
+# Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 --until exhausted, 124 timeout.
 set -u
 
-MODEL="swe-1-7-medium"
-PERM="auto"
-TIMEOUT=600
-PROMPT=""
+MODEL="swe-1-7-medium"; PERM="auto"; TIMEOUT=600; CWD=""
+PROMPT=""; PROMPT_FILE=""; PREAMBLE="${DEVIN_TASK_PREAMBLE:-}"; INHERIT_ENV=0
+ANSWER_ONLY=0; JSON=0; TRACE=0; UNTIL=""; MAX_PASSES=5
+ALLOW_EXTRA=()
+HEARTBEAT="${DEVIN_TASK_HEARTBEAT:-30}"
+USER_CONFIG="${DEVIN_TASK_USER_CONFIG:-$HOME/.config/devin/config.json}"
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+# Read-only shell commands that cannot write a file by themselves. Devin still
+# refuses redirections (> >>) and `sed -i` under these prefixes (verified).
+READ_ALLOW=(
+  "Exec(cat)" "Exec(head)" "Exec(tail)" "Exec(sed -n)" "Exec(grep)" "Exec(rg)"
+  "Exec(wc)" "Exec(ls)" "Exec(stat)" "Exec(file)" "Exec(diff)" "Exec(jq)"
+  "Exec(cut)" "Exec(tr)" "Exec(uniq)" "Exec(pwd)" "Exec(which)"
+  "Exec(git log)" "Exec(git status)" "Exec(git diff)" "Exec(git show)"
+)
+
+kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL stragglers
+  local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
+  kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
+}
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+die()   { echo "devin-task: $*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --edit)    PERM="accept-edits"; shift ;;
-    --yolo)    PERM="dangerous"; shift ;;
-    --model)   MODEL="$2"; shift 2 ;;
-    --timeout) TIMEOUT="$2"; shift 2 ;;
-    -h|--help) usage ;;
-    --)        shift; PROMPT="$*"; break ;;
-    -*)        echo "devin-task: unknown flag $1" >&2; usage ;;
-    *)         PROMPT="$*"; break ;;
+    --edit)        PERM="accept-edits"; shift ;;
+    --yolo)        PERM="dangerous"; shift ;;
+    --allow)       ALLOW_EXTRA+=("$2"); shift 2 ;;
+    --model)       MODEL="$2"; shift 2 ;;
+    --cwd)         CWD="$2"; shift 2 ;;
+    --timeout)     TIMEOUT="$2"; shift 2 ;;
+    --preamble)    PREAMBLE="$2"; shift 2 ;;
+    --inherit-env) INHERIT_ENV=1; shift ;;
+    --until)       UNTIL="$2"; shift 2 ;;
+    --max-passes)  MAX_PASSES="$2"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
+    --answer-only) ANSWER_ONLY=1; shift ;;
+    --json)        JSON=1; shift ;;
+    --trace)       TRACE=1; shift ;;
+    -h|--help)     usage ;;
+    --)            shift; PROMPT="$*"; break ;;
+    -*)            echo "devin-task: unknown flag $1" >&2; usage ;;
+    *)             PROMPT="$*"; break ;;
   esac
 done
 
-if [ -z "$PROMPT" ] && [ ! -t 0 ]; then
+# ---- prompt: --prompt-file > positional > stdin ----
+if [ -n "$PROMPT_FILE" ]; then
+  [ -r "$PROMPT_FILE" ] || die "cannot read --prompt-file $PROMPT_FILE"
+  PROMPT="$(cat "$PROMPT_FILE")"
+elif [ -z "$PROMPT" ] && [ ! -t 0 ]; then
   PROMPT="$(cat)"
 fi
 [ -z "$PROMPT" ] && usage
 
+if [ $INHERIT_ENV -eq 1 ]; then
+  ENVNOTE="Caller environment (use these explicitly; a login shell may put other versions first on PATH):"
+  ENVNOTE="$ENVNOTE"$'\n'"- python3: $(command -v python3 2>/dev/null || echo none)"
+  ENVNOTE="$ENVNOTE"$'\n'"- node: $(command -v node 2>/dev/null || echo none)"
+  [ -n "${CONDA_PREFIX:-}" ] && ENVNOTE="$ENVNOTE"$'\n'"- CONDA_PREFIX: $CONDA_PREFIX"
+  PREAMBLE="${PREAMBLE:+$PREAMBLE
+
+}$ENVNOTE"
+fi
+[ -n "$PREAMBLE" ] && PROMPT="$PREAMBLE
+
+$PROMPT"
+
+if [ -n "$CWD" ]; then
+  cd "$CWD" 2>/dev/null || die "--cwd $CWD is not a directory"
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-printf '%s' "$PROMPT" > "$WORK/prompt.md"
-ERR="$WORK/stderr"
+HAVE_PY=0; command -v python3 >/dev/null 2>&1 && HAVE_PY=1
 
-devin --model "$MODEL" \
-      --permission-mode "$PERM" \
-      --respect-workspace-trust false \
-      --prompt-file "$WORK/prompt.md" \
-      -p 2>"$ERR" &
-PID=$!
-trap 'kill "$PID" 2>/dev/null; rm -rf "$WORK"; exit 143' TERM INT
-
-waited=0
-while kill -0 "$PID" 2>/dev/null; do
-  if [ "$waited" -ge "$TIMEOUT" ]; then
-    kill "$PID" 2>/dev/null; sleep 1; kill -9 "$PID" 2>/dev/null
-    echo "devin-task: timed out after ${TIMEOUT}s" >&2
-    exit 124
+# ---- permission config: user config + read-only allowlist (+ --allow) ----
+CONFIG=""
+if [ "$PERM" != "dangerous" ] || [ ${#ALLOW_EXTRA[@]} -gt 0 ]; then
+  if [ $HAVE_PY -eq 1 ]; then
+    CONFIG="$WORK/config.json"
+    RULES=("${READ_ALLOW[@]}"); [ ${#ALLOW_EXTRA[@]} -gt 0 ] && RULES+=("${ALLOW_EXTRA[@]}")
+    python3 - "$USER_CONFIG" "$CONFIG" "${RULES[@]}" <<'PY'
+import json, sys
+src, out, rules = sys.argv[1], sys.argv[2], sys.argv[3:]
+cfg = {}
+try:
+    with open(src) as f: cfg = json.load(f)
+except Exception: pass
+allow = cfg.setdefault("permissions", {}).setdefault("allow", [])
+for r in rules:
+    if r not in allow: allow.append(r)
+with open(out, "w") as f: json.dump(cfg, f)
+PY
+  else
+    echo "devin-task: python3 not found; running without the read-only shell allowlist" >&2
   fi
-  sleep 1; waited=$((waited+1))
+fi
+
+# ---- one devin pass; sets RC, honours timeout/heartbeat ----
+run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdout-file-or-empty
+  local pf="$1" ex="$2" sid="$3" so="$4" args=()
+  [ -n "$CONFIG" ] && args+=(--config "$CONFIG")
+  if [ -n "$sid" ]; then args+=(-r "$sid"); else args+=(--model "$MODEL"); fi
+  args+=(--permission-mode "$PERM" --respect-workspace-trust false --prompt-file "$pf" --export "$ex" -p)
+  : > "$WORK/stderr"; : > "$WORK/stdout"
+  if [ -n "$so" ]; then devin "${args[@]}" >"$so" 2>"$WORK/stderr" &
+  else                  devin "${args[@]}" > >(tee "$WORK/stdout") 2>"$WORK/stderr" & fi
+  PID=$!
+  trap 'kill_tree "$PID"; rm -rf "$WORK"; exit 143' TERM INT
+  local waited=0
+  while kill -0 "$PID" 2>/dev/null; do
+    if [ "$waited" -ge "$TIMEOUT" ]; then
+      kill_tree "$PID"
+      echo "devin-task: timed out after ${TIMEOUT}s" >&2
+      RC=124; return
+    fi
+    sleep 1; waited=$((waited+1))
+    if [ $TRACE -eq 1 ] && [ $((waited % HEARTBEAT)) -eq 0 ]; then
+      local bytes; bytes=$(wc -c < "${so:-$WORK/stdout}" 2>/dev/null | tr -d ' ')
+      echo "[devin-task] ${waited}s elapsed, ${bytes:-0} bytes of output so far" >&2
+    fi
+  done
+  wait "$PID"; RC=$?
+  [ -s "$WORK/stderr" ] && cat "$WORK/stderr" >&2
+  if grep -q "rejected a tool call that requires confirmation" "$WORK/stderr"; then
+    local hint
+    case "$PERM" in
+      auto)         hint="Shell commands count too (even sed -i or python3); only the read-only allowlist runs unasked. Re-run with --edit (file edits), --yolo (any command), or --allow 'Exec(<prefix>)'." ;;
+      accept-edits) hint="Edit mode writes files but runs no commands beyond the read-only allowlist (even sed -i counts). Re-run with --yolo or --allow 'Exec(<prefix>)'." ;;
+      *)            hint="Refused even in '$PERM' mode; read the stderr above." ;;
+    esac
+    echo "devin-task: Devin refused an action in '$PERM' mode and stopped. $hint Partial edits may already be on disk; check git status." >&2
+    RC=3
+  fi
+}
+
+# ---- export helpers (need python3) ----
+export_field() {  # $1 export-file  $2 what: answer|session|tools
+  [ $HAVE_PY -eq 1 ] && [ -s "$1" ] || return 1
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); what = sys.argv[2]
+steps = d.get("steps", [])
+if what == "session":
+    print(d.get("session_id", ""))
+elif what == "answer":
+    msgs = [s.get("message") for s in steps if s.get("source") == "agent" and (s.get("message") or "").strip()]
+    print(msgs[-1] if msgs else "")
+elif what == "tools":
+    for s in steps:
+        for t in s.get("tool_calls") or []:
+            n = t.get("function_name", "?"); a = t.get("arguments") or {}
+            summ = a.get("command") or a.get("file_path") or a.get("pattern") or a.get("query") or json.dumps(a)[:120]
+            print(f"{n}: {summ}")
+PY
+}
+
+# ---- main loop ----
+PASS=1; SESSION=""; EXPORT="$WORK/export.json"
+CAPTURE=""; [ $ANSWER_ONLY -eq 1 ] || [ $JSON -eq 1 ] && CAPTURE="$WORK/stdout"
+printf '%s' "$PROMPT" > "$WORK/prompt.md"
+while :; do
+  rm -f "$EXPORT"
+  run_pass "$WORK/prompt.md" "$EXPORT" "$SESSION" "$CAPTURE"
+  [ $TRACE -eq 1 ] && [ -s "$EXPORT" ] && { echo "[devin-task] pass $PASS tool calls:" >&2; export_field "$EXPORT" tools | sed 's/^/  /' >&2; }
+  [ $RC -ne 0 ] && break
+  [ -z "$UNTIL" ] && break
+  CHECK_OUT="$(bash -c "$UNTIL" 2>&1)"; CHECK_RC=$?
+  if [ $CHECK_RC -eq 0 ]; then
+    [ $TRACE -eq 1 ] && echo "[devin-task] check passed after $PASS pass(es)" >&2
+    break
+  fi
+  if [ $PASS -ge "$MAX_PASSES" ]; then
+    echo "devin-task: check still failing after --max-passes $MAX_PASSES (exit $CHECK_RC). Last output:" >&2
+    printf '%s\n' "$CHECK_OUT" | tail -20 >&2
+    RC=5; break
+  fi
+  SESSION="$(export_field "$EXPORT" session 2>/dev/null || true)"
+  PASS=$((PASS+1))
+  {
+    if [ -n "$SESSION" ]; then
+      printf 'Pass %s of %s. The completion check `%s` still fails (exit %s). Its output:\n\n%s\n\nContinue the task until the check passes.' \
+        "$PASS" "$MAX_PASSES" "$UNTIL" "$CHECK_RC" "$(printf '%s\n' "$CHECK_OUT" | tail -40)"
+    else
+      printf '%s\n\n---\nPass %s of %s. The completion check `%s` still fails (exit %s). Its output:\n\n%s' \
+        "$PROMPT" "$PASS" "$MAX_PASSES" "$UNTIL" "$CHECK_RC" "$(printf '%s\n' "$CHECK_OUT" | tail -40)"
+    fi
+  } > "$WORK/prompt.md"
+  [ $TRACE -eq 1 ] && echo "[devin-task] check failed (exit $CHECK_RC); starting pass $PASS${SESSION:+ (resuming $SESSION)}" >&2
 done
-wait "$PID"; RC=$?
 
-[ -s "$ERR" ] && cat "$ERR" >&2
-
-if grep -q "rejected a tool call that requires confirmation" "$ERR"; then
-  case "$PERM" in
-    auto)         HINT="Re-run with --edit (file edits) or --yolo (also runs commands such as python3/pytest)." ;;
-    accept-edits) HINT="Re-run with --yolo: edit mode allows file writes but not running commands such as python3/pytest." ;;
-    *)            HINT="Refused even in '$PERM' mode; read the stderr above." ;;
-  esac
-  echo "devin-task: Devin refused an action in '$PERM' mode and stopped. $HINT Partial edits may already be on disk; check git status." >&2
-  exit 3
+# ---- output ----
+if [ $JSON -eq 1 ]; then
+  if [ $HAVE_PY -eq 1 ]; then
+    python3 - "$EXPORT" "$CAPTURE" "$RC" "$PASS" <<'PY'
+import json, sys, os
+ex, so, rc, passes = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+d = {}
+if os.path.isfile(ex) and os.path.getsize(ex):
+    try: d = json.load(open(ex))
+    except Exception: d = {}
+steps = d.get("steps", [])
+msgs = [s.get("message") for s in steps if s.get("source") == "agent" and (s.get("message") or "").strip()]
+answer = msgs[-1] if msgs else (open(so).read().strip() if os.path.isfile(so) else "")
+tools = []
+for s in steps:
+    for t in s.get("tool_calls") or []:
+        a = t.get("arguments") or {}
+        tools.append(f"{t.get('function_name','?')}: {a.get('command') or a.get('file_path') or json.dumps(a)[:120]}")
+print(json.dumps({"answer": answer, "session_id": d.get("session_id", ""), "exit_code": rc,
+                  "passes": passes, "tool_calls": tools, "metrics": d.get("final_metrics", {})}, indent=1))
+PY
+  else
+    echo "devin-task: --json needs python3" >&2
+  fi
+elif [ $ANSWER_ONLY -eq 1 ]; then
+  if ! export_field "$EXPORT" answer 2>/dev/null; then
+    echo "devin-task: no export (timeout/kill?); printing raw stdout" >&2
+    [ -f "$CAPTURE" ] && cat "$CAPTURE"
+  fi
 fi
 exit "$RC"

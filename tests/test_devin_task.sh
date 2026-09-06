@@ -9,69 +9,143 @@ PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "       $2"; }
 
-# --- stub devin: records argv, copies prompt file, obeys STUB_MODE ---
+# --- stub devin: records argv/cwd/config/prompt, writes a fake ATIF export ---
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/devin" <<'STUB'
 #!/usr/bin/env bash
-printf '%s\n' "$@" > "$STUB_ARGV"
+echo call >> "$STUB_CALLS"; n=$(wc -l < "$STUB_CALLS" | tr -d ' ')
+printf '%s\n' "$@" > "$STUB_ARGV"; cp "$STUB_ARGV" "$STUB_ARGV.$n"
+pwd > "$STUB_CWD"
+EXPORT=""
 while [ $# -gt 0 ]; do
-  if [ "$1" = "--prompt-file" ]; then cp "$2" "$STUB_PROMPT"; fi
-  shift
+  case "$1" in
+    --prompt-file) cp "$2" "$STUB_PROMPT"; cp "$2" "$STUB_PROMPT.$n"; shift 2 ;;
+    --config)      cp "$2" "$STUB_CONFIG"; shift 2 ;;
+    --export)      EXPORT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
 done
 case "${STUB_MODE:-ok}" in
-  ok)     echo "STUB-OK" ;;
+  ok)
+    echo "narrative line"; echo "STUB-OK"
+    [ -n "$EXPORT" ] && printf '%s' "{\"session_id\":\"stub-sess\",\"steps\":[{\"source\":\"user\",\"message\":\"x\"},{\"source\":\"agent\",\"message\":\"\",\"tool_calls\":[{\"function_name\":\"exec\",\"arguments\":{\"command\":\"wc -l f.txt\"}}]},{\"source\":\"agent\",\"message\":\"${STUB_ANSWER:-FINAL}\"}],\"final_metrics\":{\"total_steps\":3}}" > "$EXPORT" ;;
   reject) echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2; exit 0 ;;
   hang)   sleep 30; echo "never" ;;
 esac
 STUB
 chmod +x "$TMP/bin/devin"
-export PATH="$TMP/bin:$PATH" STUB_ARGV="$TMP/argv" STUB_PROMPT="$TMP/prompt"
-has_arg() { grep -qxF -- "$1" "$STUB_ARGV"; }
+printf '%s' '{"agent":{"model":"swe-1-7-medium"},"permissions":{"allow":["Fetch(domain:*)"]}}' > "$TMP/userconfig.json"
+export PATH="$TMP/bin:$PATH" STUB_ARGV="$TMP/argv" STUB_PROMPT="$TMP/prompt" STUB_CWD="$TMP/cwd" \
+       STUB_CONFIG="$TMP/config" STUB_CALLS="$TMP/calls" DEVIN_TASK_USER_CONFIG="$TMP/userconfig.json"
+reset() { rm -f "$STUB_ARGV"* "$STUB_PROMPT"* "$STUB_CONFIG" "$STUB_CALLS"; unset DEVIN_TASK_PREAMBLE; }
 argv_pair() { paste -sd' ' "$STUB_ARGV" | grep -qF -- "$1"; }
+has_arg()   { grep -qxF -- "$1" "$STUB_ARGV"; }
+allow_has() { python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1]))["permissions"]["allow"] else 1)' "$STUB_CONFIG" "$1"; }
 
 echo "default invocation"
-out="$("$WRAPPER" "say hi" 2>&1)"; rc=$?
-[ $rc -eq 0 ] && [ "$out" = "STUB-OK" ] && ok "exit 0, passes stdout through" || fail "exit 0 / stdout" "rc=$rc out=$out"
-argv_pair "--model swe-1-7-medium" && ok "defaults to free swe-1-7-medium" || fail "default model" "$(cat "$STUB_ARGV")"
+reset; out="$("$WRAPPER" "say hi" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$out" = $'narrative line\nSTUB-OK' ] && ok "exit 0, streams stdout through" || fail "exit 0 / stdout" "rc=$rc out=$out"
+argv_pair "--model swe-1-7-medium" && ok "defaults to free swe-1-7-medium" || fail "default model"
 argv_pair "--respect-workspace-trust false" && ok "skips workspace trust prompt" || fail "workspace trust"
 has_arg "-p" && ok "print mode" || fail "print mode"
-argv_pair "--permission-mode auto" && ok "read-only (auto) permission by default" || fail "default perm" "$(cat "$STUB_ARGV")"
-[ "$(cat "$STUB_PROMPT")" = "say hi" ] && ok "prompt delivered via --prompt-file" || fail "prompt file" "$(cat "$STUB_PROMPT" 2>&1)"
+argv_pair "--permission-mode auto" && ok "read-only (auto) permission by default" || fail "default perm"
+[ "$(cat "$STUB_PROMPT")" = "say hi" ] && ok "prompt delivered via --prompt-file" || fail "prompt file"
+has_arg "--export" && ok "always exports the conversation" || fail "export flag" "$(cat "$STUB_ARGV")"
+
+echo "read-only shell allowlist"
+[ -f "$STUB_CONFIG" ] && ok "passes a generated --config" || fail "no --config passed"
+allow_has "Exec(sed -n)" && allow_has "Exec(head)" && allow_has "Exec(grep)" && ok "allowlist has sed -n, head, grep" || fail "allowlist contents" "$(cat "$STUB_CONFIG" 2>&1)"
+! allow_has "Exec(sed)" && ! allow_has "Exec(python3)" && ok "allowlist excludes bare sed and python3" || fail "allowlist too broad"
+allow_has "Fetch(domain:*)" && ok "user's existing allow rules preserved" || fail "user rules lost"
+python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["agent"]["model"]=="swe-1-7-medium" else 1)' "$STUB_CONFIG" && ok "rest of user config preserved" || fail "user config clobbered"
+reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
+[ -f "$STUB_CONFIG" ] && allow_has "Exec(head)" && ok "--edit also gets the allowlist" || fail "edit allowlist"
+reset; "$WRAPPER" --yolo "x" >/dev/null 2>&1
+[ ! -f "$STUB_CONFIG" ] && ok "--yolo passes no --config" || fail "yolo config"
+reset; "$WRAPPER" --allow 'Exec(python3 -c)' --allow 'Exec(make test)' "x" >/dev/null 2>&1
+allow_has "Exec(python3 -c)" && allow_has "Exec(make test)" && ok "--allow (repeatable) extends the allowlist" || fail "--allow" "$(cat "$STUB_CONFIG" 2>&1)"
 
 echo "flags"
-"$WRAPPER" --edit "x" >/dev/null 2>&1
-argv_pair "--permission-mode accept-edits" && ok "--edit -> accept-edits" || fail "--edit" "$(cat "$STUB_ARGV")"
-"$WRAPPER" --yolo "x" >/dev/null 2>&1
-argv_pair "--permission-mode dangerous" && ok "--yolo -> dangerous" || fail "--yolo" "$(cat "$STUB_ARGV")"
-"$WRAPPER" --model swe-1-7 "x" >/dev/null 2>&1
-argv_pair "--model swe-1-7" && ! argv_pair "swe-1-7-medium" && ok "--model overrides" || fail "--model" "$(cat "$STUB_ARGV")"
+reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
+argv_pair "--permission-mode accept-edits" && ok "--edit -> accept-edits" || fail "--edit"
+reset; "$WRAPPER" --yolo "x" >/dev/null 2>&1
+argv_pair "--permission-mode dangerous" && ok "--yolo -> dangerous" || fail "--yolo"
+reset; "$WRAPPER" --model swe-1-7 "x" >/dev/null 2>&1
+argv_pair "--model swe-1-7" && ! argv_pair "swe-1-7-medium" && ok "--model overrides" || fail "--model"
+reset; mkdir -p "$TMP/work"; "$WRAPPER" --cwd "$TMP/work" "x" >/dev/null 2>&1
+[ "$(cat "$STUB_CWD")" = "$(cd "$TMP/work" && pwd)" ] && ok "--cwd runs devin in that directory" || fail "--cwd" "$(cat "$STUB_CWD")"
+out="$("$WRAPPER" --cwd "$TMP/nope" "x" 2>&1)"; rc=$?
+[ $rc -eq 2 ] && ok "--cwd missing dir -> exit 2" || fail "--cwd missing" "rc=$rc $out"
 
 echo "prompt handling"
-tricky=$'line one "quoted" `backtick` $HOME\nline two'
+reset; tricky=$'line one "quoted" `backtick` $HOME\nline two'
 "$WRAPPER" "$tricky" >/dev/null 2>&1
-[ "$(cat "$STUB_PROMPT")" = "$tricky" ] && ok "quotes/backticks/newlines survive" || fail "tricky prompt" "$(cat "$STUB_PROMPT")"
-printf 'from stdin\n' | "$WRAPPER" >/dev/null 2>&1
-[ "$(cat "$STUB_PROMPT")" = "from stdin" ] && ok "reads prompt from stdin when no arg" || fail "stdin prompt" "$(cat "$STUB_PROMPT")"
+[ "$(cat "$STUB_PROMPT")" = "$tricky" ] && ok "quotes/backticks/newlines survive" || fail "tricky prompt"
+reset; printf 'from stdin\n' | "$WRAPPER" >/dev/null 2>&1
+[ "$(cat "$STUB_PROMPT")" = "from stdin" ] && ok "reads prompt from stdin when no arg" || fail "stdin prompt"
+reset; printf 'from file' > "$TMP/p.md"; "$WRAPPER" --prompt-file "$TMP/p.md" "ignored positional" >/dev/null 2>&1
+[ "$(cat "$STUB_PROMPT")" = "from file" ] && ok "--prompt-file wins over positional" || fail "--prompt-file" "$(cat "$STUB_PROMPT")"
 out="$("$WRAPPER" 2>&1 </dev/null)"; rc=$?
-[ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc out=$out"
+[ $rc -ne 0 ] && echo "$out" | grep -qi "usage" && ok "no prompt -> usage, nonzero" || fail "empty prompt" "rc=$rc"
+reset; "$WRAPPER" --preamble "USE THIS PYTHON" "task body" >/dev/null 2>&1
+[ "$(cat "$STUB_PROMPT")" = $'USE THIS PYTHON\n\ntask body' ] && ok "--preamble prepended with blank line" || fail "--preamble" "$(cat "$STUB_PROMPT")"
+reset; DEVIN_TASK_PREAMBLE="ENV PRE" "$WRAPPER" "task body" >/dev/null 2>&1
+[ "$(cat "$STUB_PROMPT")" = $'ENV PRE\n\ntask body' ] && ok "DEVIN_TASK_PREAMBLE honored" || fail "env preamble" "$(cat "$STUB_PROMPT")"
+reset; "$WRAPPER" --inherit-env "task body" >/dev/null 2>&1
+grep -qF "python3: $(command -v python3)" "$STUB_PROMPT" && grep -q "task body" "$STUB_PROMPT" && ok "--inherit-env names caller's python3" || fail "--inherit-env" "$(cat "$STUB_PROMPT")"
+! grep -q "PATH=" "$STUB_PROMPT" && ok "--inherit-env does not dump PATH" || fail "inherit-env PATH dump"
+
+echo "output modes"
+reset; out="$(STUB_ANSWER="the final word" "$WRAPPER" --answer-only "x" 2>/dev/null)"; rc=$?
+[ $rc -eq 0 ] && [ "$out" = "the final word" ] && ok "--answer-only prints only the last agent message" || fail "--answer-only" "rc=$rc out=$out"
+reset; out="$("$WRAPPER" --json "x" 2>/dev/null)"; rc=$?
+echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["answer"]=="FINAL"; assert d["session_id"]=="stub-sess"; assert d["exit_code"]==0; assert any("wc -l f.txt" in t for t in d["tool_calls"]); assert d["passes"]==1' 2>/dev/null && ok "--json has answer, session_id, exit_code, tool_calls, passes" || fail "--json" "$out"
+reset; out="$(DEVIN_TASK_HEARTBEAT=1 STUB_MODE=hang "$WRAPPER" --trace --timeout 3 "x" 2>&1 >/dev/null)"
+echo "$out" | grep -q "elapsed" && ok "--trace heartbeats to stderr while running" || fail "--trace heartbeat" "$out"
+reset; out="$("$WRAPPER" --trace "x" 2>&1 >/dev/null)"
+echo "$out" | grep -q "exec: wc -l f.txt" && ok "--trace lists tool calls from export after run" || fail "--trace tool list" "$out"
 
 echo "failure surfacing"
-out="$(STUB_MODE=reject "$WRAPPER" "write a file" 2>&1)"; rc=$?
-[ $rc -eq 3 ] && ok "rejected write -> exit 3" || fail "reject exit" "rc=$rc"
+reset; out="$(STUB_MODE=reject "$WRAPPER" "write a file" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ok "rejected action -> exit 3" || fail "reject exit" "rc=$rc"
 echo "$out" | grep -q -- "--edit" && ok "rejection in auto mode suggests --edit" || fail "reject hint auto" "$out"
+echo "$out" | grep -qi "even sed" && echo "$out" | grep -q -- "--allow" && ok "hint says shell commands count (even sed) and names --allow" || fail "hint shell note" "$out"
 echo "$out" | grep -qi "partial" && ok "rejection warns about partial edits" || fail "partial warning" "$out"
-out="$(STUB_MODE=reject "$WRAPPER" --edit "run tests" 2>&1)"; rc=$?
+reset; out="$(STUB_MODE=reject "$WRAPPER" --edit "run tests" 2>&1)"; rc=$?
 [ $rc -eq 3 ] && echo "$out" | grep -q -- "--yolo" && ! echo "$out" | grep -q -- "--edit (" && ok "rejection in edit mode suggests --yolo only" || fail "reject hint edit" "rc=$rc $out"
-out="$(STUB_MODE=hang "$WRAPPER" --timeout 2 "slow" 2>&1)"; rc=$?
+reset; out="$(STUB_MODE=hang "$WRAPPER" --timeout 2 "slow" 2>&1)"; rc=$?
 [ $rc -eq 124 ] && echo "$out" | grep -qi "timed out" && ok "--timeout kills and exits 124" || fail "timeout" "rc=$rc out=$out"
 STUB_MODE=hang "$WRAPPER" --timeout 30 "slow" >/dev/null 2>&1 &
 wpid=$!; sleep 1; kill -TERM "$wpid"; sleep 2
 if pgrep -f "$TMP/bin/devin" >/dev/null; then fail "SIGTERM to wrapper kills devin child"; pkill -f "$TMP/bin/devin"; else ok "SIGTERM to wrapper kills devin child"; fi
 
+echo "--until loop"
+cat > "$TMP/check.sh" <<'CHK'
+#!/usr/bin/env bash
+n=$(cat "$CHECK_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$CHECK_COUNT"
+echo "still missing rows: $((4-n))"; [ "$n" -ge 3 ]
+CHK
+chmod +x "$TMP/check.sh"; export CHECK_COUNT="$TMP/count"
+reset; rm -f "$CHECK_COUNT"; out="$("$WRAPPER" --until "$TMP/check.sh" --max-passes 5 "label the rows" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "3" ] && ok "--until reruns until check passes (3 passes) and exits 0" || fail "--until loop" "rc=$rc calls=$(cat "$STUB_CALLS" 2>/dev/null | wc -l) $out"
+paste -sd' ' "$STUB_ARGV.2" | grep -qF -- "-r stub-sess" && ok "pass 2 resumes the session by id" || fail "resume by id" "$(cat "$STUB_ARGV.2")"
+! grep -qF -- "--model" "$STUB_ARGV.2" && ok "resume does not re-pass --model" || fail "resume model flag"
+grep -q "still missing rows: 3" "$STUB_PROMPT.2" && grep -qi "check" "$STUB_PROMPT.2" && ok "pass 2 prompt carries the check output" || fail "pass 2 prompt" "$(cat "$STUB_PROMPT.2")"
+[ "$(cat "$STUB_PROMPT.1")" = "label the rows" ] && ok "pass 1 prompt is the original" || fail "pass 1 prompt"
+reset; rm -f "$CHECK_COUNT"; out="$("$WRAPPER" --until "$TMP/check.sh" --max-passes 2 "label" 2>&1)"; rc=$?
+[ $rc -eq 5 ] && echo "$out" | grep -qi "max-passes" && ok "exhausting --max-passes -> exit 5" || fail "max passes" "rc=$rc $out"
+reset; rm -f "$CHECK_COUNT"; out="$(STUB_MODE=reject "$WRAPPER" --until "$TMP/check.sh" "label" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && [ "$(wc -l < "$STUB_CALLS" | tr -d ' ')" = "1" ] && ok "refusal inside --until stops immediately" || fail "until refusal" "rc=$rc"
+reset; rm -f "$CHECK_COUNT"; out="$("$WRAPPER" --until "$TMP/check.sh" --json "label" 2>/dev/null)"
+echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["passes"]==3' 2>/dev/null && ok "--json reports pass count" || fail "json passes" "$out"
+
 echo "live (real devin, free model)"
-PATH="${PATH#$TMP/bin:}" 
+PATH="${PATH#$TMP/bin:}"; unset DEVIN_TASK_USER_CONFIG
 out="$(cd "$TMP" && "$WRAPPER" --timeout 60 "Reply with exactly the word PONG and nothing else." 2>&1)"; rc=$?
 [ $rc -eq 0 ] && echo "$out" | grep -q PONG && ok "real devin round-trip" || fail "live" "rc=$rc out=$out"
+printf 'a\nb\nc\n' > "$TMP/f.txt"
+out="$(cd "$TMP" && "$WRAPPER" --answer-only --timeout 90 "Run exactly: head -2 f.txt   then reply with only the output, nothing else." 2>&1)"; rc=$?
+[ $rc -eq 0 ] && echo "$out" | grep -q "^b" && ok "live read-only head via allowlist, answer-only" || fail "live allowlist" "rc=$rc out=$out"
 
 echo; echo "passed=$PASS failed=$FAIL"
 [ $FAIL -eq 0 ]
