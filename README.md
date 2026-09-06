@@ -94,19 +94,24 @@ capacity varies by the hour.
 | Setup | Throughput | Notes |
 |---|---|---|
 | 1 session | ~100 rows / 8 min | steady, no throttling |
-| 5 concurrent | ~60 rows / 3–14 min **each**, median ~7 (n=34 passes) | ran clean for an hour |
+| 5 concurrent | 60 rows per pass: median 334s, p75 652s, max 904s (n=37) | ran clean for an hour |
 | 8 concurrent | — | hard drop-off: throttled on about a third of passes |
 
 `--max-concurrent 5 --backoff 60` were the settings that ran clean. Five is the
 ceiling worth planning around; eight buys nothing, because the retries the
 throttling forces cost more than the extra sessions add.
 
-Mind the spread on that middle row. The median pass is comfortable but the tail
-is long — individual sessions grind — and **the slowest passes run past the
-default `--timeout` of 600 seconds**, which kills them at exit 124. For batch
-work raise `--timeout` (1200 is a reasonable starting point at 5 concurrent),
-and keep the output append-only as described below, so a pass that is killed
-anyway still banks the rows it had written.
+That middle row is quoted as percentiles rather than a range because the spread
+is the point: identical work — 60 rows a pass — took anywhere from 57s to 904s,
+a factor of sixteen, across 37 passes. Plan against p75 and the max, not the
+median. A timeout picked from the median kills the slow quarter of your run.
+
+Concretely: **10 of those 37 passes ran longer than 600 seconds**, so the
+default `--timeout` would have killed 27% of them at exit 124 — not just an
+unlucky tail. `--timeout 1200` is not conservative, it is about right; the run
+these numbers come from used 900 and had a pass finish at 904s, grazing its own
+ceiling. Keep the output append-only as described below, so a pass that is
+killed anyway still banks the rows it had already written.
 
 ### Classifying upstream failures, and `--retries`
 
