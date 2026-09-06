@@ -38,6 +38,7 @@ and partial edits may already be on disk.
 |---|---|
 | default | use file tools, and run the read-only shell allowlist: `cat head tail sed -n grep rg wc ls stat file diff jq cut tr uniq pwd which git log/status/diff/show` (pipes allowed; `>` redirection and `sed -i` are refused) |
 | `--edit` | also write files. Still no commands beyond the allowlist. |
+| `--smart` | Devin's `--permission-mode smart`: additionally auto-runs actions a fast model judges safe, per Devin's help text. Still gets the read-only allowlist. On this account Devin reports it "not available" and falls back to normal; whether the judging model bills anything when it does become available is unverified. |
 | `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote. |
 
 `--allow 'Exec(<prefix>)'` (repeatable) extends the allowlist in any mode,
@@ -104,4 +105,4 @@ models. Each run has its own session, temp prompt and export.
 `swe-1-7-medium`, `swe-1-7` and `glm-5-2` are free on this account. Any other
 `--model` bills Devin credits; `devin models list` shows prices.
 
-Tests: `bash tests/test_devin_task.sh` (68 stub-devin checks plus two live calls).
+Tests: `bash tests/test_devin_task.sh` (70 stub-devin checks plus two live calls).

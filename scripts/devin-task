@@ -8,6 +8,7 @@
 #
 # Permission (default is read-only: file tools plus a read-only shell allowlist):
 #   --edit               also allow file edits in the workspace      (accept-edits)
+#   --smart              additionally auto-run actions a fast model judges safe (smart)
 #   --yolo               auto-approve everything, incl. any command  (dangerous)
 #   --allow 'Exec(cmd)'  add a Devin permission rule (repeatable), e.g. 'Exec(python3 -c)'
 # Run:
@@ -65,7 +66,7 @@ kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL straggl
   local p; for p in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$p"; done
   kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null
 }
-usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 die()   { echo "devin-task: $*" >&2; exit 2; }
 
 # ---- classify an upstream failure from a failed pass's stderr+stdout; sets RC ----
@@ -91,6 +92,7 @@ classify_failure() {  # $1 stderr-file  $2 stdout-file
 while [ $# -gt 0 ]; do
   case "$1" in
     --edit)        PERM="accept-edits"; shift ;;
+    --smart)       PERM="smart"; shift ;;
     --yolo)        PERM="dangerous"; shift ;;
     --allow)       ALLOW_EXTRA+=("$2"); shift 2 ;;
     --model)       MODEL="$2"; shift 2 ;;

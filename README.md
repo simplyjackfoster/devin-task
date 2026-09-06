@@ -50,6 +50,7 @@ printf '%s' "$PROMPT" | devin-task [flags]
 |---|---|
 | (none) | read-only: file tools plus a read-only shell allowlist (below) |
 | `--edit` | also write files in the workspace; still no commands beyond the allowlist |
+| `--smart` | passes Devin's `--permission-mode smart` (per Devin's help: "additionally auto-runs actions a fast model judges safe"); still gets the generated read-only allowlist. On this account Devin currently reports it "not available" and falls back to normal (see below) |
 | `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote |
 | `--allow 'Exec(prefix)'` | add a Devin permission rule, repeatable, e.g. `'Exec(python3 -c)'` |
 | `--model M` | default `swe-1-7-medium`; `swe-1-7` and `glm-5-2` are also free at time of writing |
@@ -195,7 +196,7 @@ Verified against Devin CLI 3000.6.14 on macOS:
 bash tests/test_devin_task.sh
 ```
 
-Sixty-eight checks against a stub `devin` on PATH (argv, generated config and
+Seventy checks against a stub `devin` on PATH (argv, generated config and
 allowlist, prompt delivery, preamble, output modes, refusal detection,
 timeout, signal propagation, failure classification, `--retries`, the
 `--until` loop, empty-turn detection and `--no-empty-retry`, including a

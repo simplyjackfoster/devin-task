@@ -138,6 +138,8 @@ allow_has "Fetch(domain:*)" && ok "user's existing allow rules preserved" || fai
 python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["agent"]["model"]=="swe-1-7-medium" else 1)' "$STUB_CONFIG" && ok "rest of user config preserved" || fail "user config clobbered"
 reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
 [ -f "$STUB_CONFIG" ] && allow_has "Exec(head)" && ok "--edit also gets the allowlist" || fail "edit allowlist"
+reset; "$WRAPPER" --smart "x" >/dev/null 2>&1
+[ -f "$STUB_CONFIG" ] && allow_has "Exec(head)" && ok "--smart also gets the allowlist" || fail "smart allowlist"
 reset; "$WRAPPER" --yolo "x" >/dev/null 2>&1
 [ ! -f "$STUB_CONFIG" ] && ok "--yolo passes no --config" || fail "yolo config"
 reset; "$WRAPPER" --allow 'Exec(python3 -c)' --allow 'Exec(make test)' "x" >/dev/null 2>&1
@@ -146,6 +148,8 @@ allow_has "Exec(python3 -c)" && allow_has "Exec(make test)" && ok "--allow (repe
 echo "flags"
 reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
 argv_pair "--permission-mode accept-edits" && ok "--edit -> accept-edits" || fail "--edit"
+reset; "$WRAPPER" --smart "x" >/dev/null 2>&1
+argv_pair "--permission-mode smart" && [ -f "$STUB_CONFIG" ] && ok "--smart -> permission-mode smart, with a --config" || fail "--smart"
 reset; "$WRAPPER" --yolo "x" >/dev/null 2>&1
 argv_pair "--permission-mode dangerous" && ok "--yolo -> dangerous" || fail "--yolo"
 reset; "$WRAPPER" --model swe-1-7 "x" >/dev/null 2>&1
