@@ -40,7 +40,7 @@ and partial edits may already be on disk.
 
 | Mode | Devin may |
 |---|---|
-| default | use file tools, and run the read-only shell allowlist: `cat head tail sed -n grep rg wc ls stat file diff jq cut tr uniq pwd which git log/status/diff/show` (pipes allowed; `>` redirection and `sed -i` are refused) |
+| default | use file tools, and run the read-only shell allowlist: `cat head tail sed -n grep rg wc ls stat file diff jq cut tr uniq pwd which` plus read-only git (`log status diff show grep ls-files ls-tree blame rev-parse cat-file show-ref describe` — subcommands, never bare `git`) (pipes allowed; `>` redirection and `sed -i` are refused). Paths are not confined to `--cwd`: a task may read another checkout by absolute path |
 | `--edit` | also write files. Still no commands beyond the allowlist. |
 | `--smart` | Devin's `--permission-mode smart`: additionally auto-runs actions a fast model judges safe, per Devin's help text. Still gets the read-only allowlist. On this account Devin reports it "not available" and falls back to normal; whether the judging model bills anything when it does become available is unverified. |
 | `--yolo` | run anything. Use for "write a script" tasks: Devin always runs what it wrote. |
@@ -123,7 +123,7 @@ a large minority of passes at exit 124 rather than just an unlucky tail.
 
 ## Failure modes
 
-- Exit 3: refused action. The message names the flag to use; check `git status`.
+- Exit 3: refused action. The message names the refused command (`Last tool call before it stopped: …`) and the flag to use; check `git status`.
 - Exit 124: timed out; the process tree is killed. Narrow the task or raise `--timeout`.
 - Exit 5: `--until` check still failing after `--max-passes`, or `--max-stalls`
   consecutive passes with no `--progress` gain. Its last output is on stderr.

@@ -39,6 +39,12 @@ case "${STUB_MODE:-ok}" in
     fi
     ;;
   reject) echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2; exit 0 ;;
+  reject_export)  # the real CLI exports the refused call as the last tool call
+    echo "warning: rejected a tool call that requires confirmation. Running in non-interactive mode. Use --permission-mode dangerous to auto-approve all tools." >&2
+    if [ -n "$EXPORT" ]; then
+      printf '%s' '{"session_id":"stub-sess","steps":[{"source":"agent","message":"","tool_calls":[{"function_name":"exec","arguments":{"command":"ls -la"}},{"function_name":"exec","arguments":{"command":"git grep -n needle"}}]}]}' > "$EXPORT"
+    fi
+    exit 0 ;;
   hang)   sleep 30; echo "never" ;;
   hang_quiet) exec sleep 30 ;;   # exec: no shell left to print anything after the kill
   capacity)  echo "Error: the servers are currently overloaded, please try again later" >&2; exit 1 ;;
@@ -175,6 +181,8 @@ echo "read-only shell allowlist"
 [ -f "$STUB_CONFIG" ] && ok "passes a generated --config" || fail "no --config passed"
 allow_has "Exec(sed -n)" && allow_has "Exec(head)" && allow_has "Exec(grep)" && ok "allowlist has sed -n, head, grep" || fail "allowlist contents" "$(cat "$STUB_CONFIG" 2>&1)"
 ! allow_has "Exec(sed)" && ! allow_has "Exec(python3)" && ok "allowlist excludes bare sed and python3" || fail "allowlist too broad"
+allow_has "Exec(git grep)" && allow_has "Exec(git ls-files)" && allow_has "Exec(git rev-parse)" && ok "allowlist has the read-only git subcommands" || fail "git subcommands missing" "$(cat "$STUB_CONFIG" 2>&1)"
+! allow_has "Exec(git)" && ok "allowlist has no bare Exec(git) (it would clear push/commit/reset)" || fail "bare git allowed"
 allow_has "Fetch(domain:*)" && ok "user's existing allow rules preserved" || fail "user rules lost"
 python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["agent"]["model"]=="swe-1-7-medium" else 1)' "$STUB_CONFIG" && ok "rest of user config preserved" || fail "user config clobbered"
 reset; "$WRAPPER" --edit "x" >/dev/null 2>&1
@@ -236,6 +244,11 @@ reset; out="$(STUB_MODE=reject "$WRAPPER" "write a file" 2>&1)"; rc=$?
 echo "$out" | grep -q -- "--edit" && ok "rejection in auto mode suggests --edit" || fail "reject hint auto" "$out"
 echo "$out" | grep -qi "even sed" && echo "$out" | grep -q -- "--allow" && ok "hint says shell commands count (even sed) and names --allow" || fail "hint shell note" "$out"
 echo "$out" | grep -qi "partial" && ok "rejection warns about partial edits" || fail "partial warning" "$out"
+reset; out="$(STUB_MODE=reject_export "$WRAPPER" "search the tree" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && echo "$out" | grep -q "git grep -n needle" && ok "rejection names the last tool call from the export" || fail "reject culprit" "rc=$rc $out"
+echo "$out" | grep -q "ls -la" && fail "reject culprit names an earlier call too" || ok "rejection names only the LAST tool call"
+reset; out="$(STUB_MODE=reject "$WRAPPER" "write a file" 2>&1)"; rc=$?
+[ $rc -eq 3 ] && ! echo "$out" | grep -qi "last tool call" && ok "rejection with no export omits the tool-call line" || fail "reject no-export degrade" "rc=$rc $out"
 reset; out="$(STUB_MODE=reject "$WRAPPER" --edit "run tests" 2>&1)"; rc=$?
 [ $rc -eq 3 ] && echo "$out" | grep -q -- "--yolo" && ! echo "$out" | grep -q -- "--edit (" && ok "rejection in edit mode suggests --yolo only" || fail "reject hint edit" "rc=$rc $out"
 reset; out="$(STUB_MODE=hang "$WRAPPER" --timeout 2 "slow" 2>&1)"; rc=$?

@@ -81,11 +81,20 @@ USER_CONFIG="${DEVIN_TASK_USER_CONFIG:-$HOME/.config/devin/config.json}"
 
 # Read-only shell commands that cannot write a file by themselves. Devin still
 # refuses redirections (> >>) and `sed -i` under these prefixes (verified).
+#
+# git is listed SUBCOMMAND BY SUBCOMMAND, never as bare "Exec(git)": these are
+# prefix rules, so "Exec(git)" would also clear `git push`, `git commit` and
+# `git reset`. Every subcommand here only reads. `git grep` earns its place
+# next to plain grep — it is the natural search over a tree or a revision
+# (`git grep pat REV`), and without it a review or archaeology task fails at
+# its first search.
 READ_ALLOW=(
   "Exec(cat)" "Exec(head)" "Exec(tail)" "Exec(sed -n)" "Exec(grep)" "Exec(rg)"
   "Exec(wc)" "Exec(ls)" "Exec(stat)" "Exec(file)" "Exec(diff)" "Exec(jq)"
   "Exec(cut)" "Exec(tr)" "Exec(uniq)" "Exec(pwd)" "Exec(which)"
   "Exec(git log)" "Exec(git status)" "Exec(git diff)" "Exec(git show)"
+  "Exec(git grep)" "Exec(git ls-files)" "Exec(git ls-tree)" "Exec(git blame)"
+  "Exec(git rev-parse)" "Exec(git cat-file)" "Exec(git show-ref)" "Exec(git describe)"
 )
 
 kill_tree() {  # SIGTERM a process and everything under it, then SIGKILL stragglers
@@ -320,13 +329,24 @@ run_pass() {  # $1 prompt-file  $2 export-file  $3 session-id-or-empty  $4 stdou
   release_slot
   [ -s "$WORK/stderr" ] && cat "$WORK/stderr" >&2
   if grep -q "rejected a tool call that requires confirmation" "$WORK/stderr"; then
+    local hint culprit=""
+    # The export records the refused call as its LAST tool call (verified: a
+    # refused `git grep` pass exports exactly that one call), so name it. It is
+    # the whole diagnosis — without it the message says only that SOMETHING was
+    # refused, and finding which command cost a bisect of probe runs. Best
+    # effort: no python3, no export, or a SIGTERM that cleared $WORK all leave
+    # it empty, and the message reads as it always did.
+    if [ -n "${ex:-}" ] && [ -s "${ex:-/nonexistent}" ]; then
+      culprit="$(export_field "$ex" tools 2>/dev/null | tail -1)"
+    fi
+    [ -n "$culprit" ] && culprit="Last tool call before it stopped: ${culprit}. "
     local hint
     case "$PERM" in
       auto)         hint="Shell commands count too (even sed -i or python3); only the read-only allowlist runs unasked. Re-run with --edit (file edits), --yolo (any command), or --allow 'Exec(<prefix>)'." ;;
       accept-edits) hint="Edit mode writes files but runs no commands beyond the read-only allowlist (even sed -i counts). Re-run with --yolo or --allow 'Exec(<prefix>)'." ;;
       *)            hint="Refused even in '$PERM' mode; read the stderr above." ;;
     esac
-    echo "devin-task: Devin refused an action in '$PERM' mode and stopped. $hint Partial edits may already be on disk; check git status." >&2
+    echo "devin-task: Devin refused an action in '$PERM' mode and stopped. ${culprit}$hint Partial edits may already be on disk; check git status." >&2
     RC=3
   elif [ "$RC" -ne 0 ]; then
     classify_failure "$WORK/stderr" "${so:-$WORK/stdout}"
