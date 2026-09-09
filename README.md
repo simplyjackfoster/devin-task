@@ -72,6 +72,12 @@ printf '%s' "$PROMPT" | devin-task [flags]
 | `--trace` | heartbeat on stderr every 30s (elapsed, bytes of output) and the tool-call list after each pass |
 | `--summary` | one line on stderr at exit: `devin-task: 137s elapsed, 24 tool calls, exit 0`. Off unless the flag or `DEVIN_TASK_SUMMARY=1` is given, so existing callers' stderr is unchanged. For logging per-pass cost from a batch driver without parsing `--json` |
 
+On exit 3 the message names the last tool call Devin made, which is the
+refused one — `Last tool call before it stopped: exec: python3 -c "print(42)"`
+— so a refusal says what to `--allow` instead of only that something was
+refused. It is best effort: with no `python3`, no export, or a SIGTERM that
+already cleaned up, the line is omitted and the message reads as before.
+
 Exit codes: 0 ok, 2 usage, 3 Devin refused an action, 5 `--until` exhausted
 (`--max-passes`, or `--max-stalls` under `--progress`),
 6 connection error, capacity, rate limit or no free concurrency slot
@@ -179,14 +185,30 @@ run. The wrapper generates a config for each run that merges your
 
 ```
 cat head tail "sed -n" grep rg wc ls stat file diff jq cut tr uniq pwd which
-git log / git status / git diff / git show
+git log / status / diff / show / grep / ls-files / ls-tree / blame
+    / rev-parse / cat-file / show-ref / describe
 ```
+
+git is listed subcommand by subcommand and never as a bare `Exec(git)`: these
+are prefix rules, so one bare entry would also clear `git push`, `git commit`
+and `git reset`.
+
+`git grep` belongs next to plain `grep`. It is the natural way to search a
+work tree or a revision (`git grep pat REV`), and while it was missing, any
+review, archaeology or before/after task died at its first search — with a
+refusal message that did not say which command caused it. Both halves of that
+are fixed.
 
 Verified: pipes between these pass, `>` redirection and `sed -i` are still
 refused. Anything that can write on its own (`python3`, `awk`, `find`,
 `sort -o`, `tee`) is deliberately absent; add it with `--allow` when a task
 needs it. Needs `python3` on the caller's PATH to build the config; without
 it the wrapper warns and runs with Devin's defaults.
+
+Paths are not restricted to the working directory. A task may read anywhere
+the caller can — verified: `cat /some/other/repo/file.go` runs from a
+`--cwd` elsewhere. So a before/after task can point at two checkouts by
+absolute path; it does not need them nested.
 
 ### Resumable tasks with `--until`
 
