@@ -96,4 +96,13 @@ FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="m" \
 found13="$(find "$FREEBUFF_CONFIG_DIR/projects" -name chat-meta.json | sort | tail -1)"
 [ -n "$found13" ] && grep -q "glm-5.3-flash" "$found13" && ok "/model selection sent" || bad "model not selected: $(cat "$found13" 2>/dev/null)"
 
+# Task 14: --until / --progress loop with conversation resume
+# --until that succeeds on the first check ends immediately with 0
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="loop" \
+  run_to 40 "$FT" --cwd "$REPO" --until "true" --json "go" >"$WORK/o14" 2>/dev/null || true
+python3 -c "import json; d=json.load(open('$WORK/o14')); assert d['exit_code']==0 and d['passes']>=1, d" && ok "--until success" || bad "--until: $(cat "$WORK/o14")"
+# --until that never succeeds hits max-passes -> exit 5
+set +e; FAKE_FREEBUFF_SCENARIO=answer run_to 60 "$FT" --cwd "$REPO" --until "false" --max-passes 2 "go" >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" -eq 5 ] && ok "--until exhausted -> 5" || bad "exhausted rc=$rc"
+
 exit $fail

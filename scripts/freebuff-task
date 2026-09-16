@@ -17,6 +17,14 @@ EXIT_UNTIL, EXIT_RETRY, EXIT_AUTH, EXIT_EMPTY, EXIT_TIMEOUT = 5, 6, 8, 9, 124
 DEFAULT_PREAMBLE = ("There is nobody watching this run. Do not ask questions; "
                     "decide and proceed, or stop. Your final message is the "
                     "answer; put it last.")
+# Task 1's live verification of `freebuff --continue <id>` has not happened yet
+# (see .superpowers/sdd/2026-09-16-freebuff-task/TASK1-for-user.md). Per the
+# plan's design intent we default to assuming it works and resume the same
+# conversation; if that assumption turns out wrong, flip this to False and
+# run_loop falls back to fresh sessions with the prior answer + check output
+# prepended to the prompt instead. See task-F-report.md for how this was
+# handled against the fake (which ignores --continue either way).
+CONTINUE_SUPPORTED = True
 
 def parse_args(argv):
     p = argparse.ArgumentParser(prog=PROG, add_help=True)
@@ -61,9 +69,9 @@ def main(argv):
     args = parse_args(argv)
     def err(m): sys.stderr.write(f"{PROG}: {m}\n")
     prompt = read_prompt(args, err)
-    # run_once / run_loop wired in later tasks; placeholder call:
-    from_run = run_once(args, prompt, err)
-    return from_run
+    if args.until:
+        return run_loop(args, prompt, err)
+    return run_once(args, prompt, err)
 
 def _git(root, *a):
     return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True)
@@ -349,13 +357,31 @@ def select_model(proc, model, deadline):
             return
         time.sleep(0.2)
 
-def run_once(args, prompt, err):
+def _one_pass(args, prompt, resume_id, err, reuse_wt=None):
+    """Run a single freebuff pass: lock the instance slot, spawn the pty,
+    drive one prompt to completion, and return (rc, result, wt, cwd).
+
+    `reuse_wt`, when given, is the (cwd, wt, root) tuple from an earlier
+    `run_dir` call; passing the same tuple across multiple `_one_pass` calls
+    keeps one worktree for a whole run_loop instead of making a new one per
+    pass. `result` is None only when freebuff itself never became usable
+    (known failure screen or unresponsive); callers should not emit in that
+    case, matching the pre-loop run_once behaviour.
+    """
     start = time.time()
     with instance_lock(args.slot_timeout, err):
-        cwd, wt, root = run_dir(args, err)
+        if reuse_wt is not None:
+            cwd, wt, root = reuse_wt
+        else:
+            cwd, wt, root = run_dir(args, err)
         before = snapshot_chats(cwd)
         env = dict(os.environ); env["TERM"] = "xterm-256color"
-        proc = PtyProcess().spawn(["freebuff", "--cwd", cwd], env)
+        resume = "continue" if (resume_id and CONTINUE_SUPPORTED) else "fresh"
+        argv = ["freebuff"]
+        if resume == "continue":
+            argv += ["--continue", resume_id]
+        argv += ["--cwd", cwd]
+        proc = PtyProcess().spawn(argv, env)
         deadline = time.time() + args.timeout
         chatdir = wait_ready(proc, cwd, before, 0.75, deadline)
         if not chatdir:
@@ -363,11 +389,91 @@ def run_once(args, prompt, err):
             code = classify(proc.screen.decode(errors="replace"))
             proc.close()
             if code is not None:
-                err("freebuff hit a known failure screen"); return code
-            err("freebuff never became ready"); return EXIT_ERR
+                err("freebuff hit a known failure screen"); return code, None, wt, cwd
+            err("freebuff never became ready"); return EXIT_ERR, None, wt, cwd
         select_model(proc, args.model, deadline)
-        rc = drive(proc, args, prompt, chatdir, wt, deadline, err, start, root)
+        rc, result = drive(proc, args, prompt, chatdir, deadline, err, start)
+        result["resume"] = resume
+        return rc, result, wt, cwd
+
+def run_once(args, prompt, err):
+    dirs = run_dir(args, err)
+    _, _, root = dirs
+    rc, result, wt, cwd = _one_pass(args, prompt, None, err, reuse_wt=dirs)
+    if result is None:
         return rc
+    diff = stat = ""
+    if wt and (args.diff or args.json or args.apply):
+        diff, stat = worktree_diff(wt)
+    if args.apply and wt and rc == EXIT_OK:
+        if not apply_diff(root, diff, err):
+            rc = EXIT_ERR
+            result["exit_code"] = rc
+    emit(args, result, wt, diff, stat)
+    return rc
+
+def _check(cmd, cwd):
+    return subprocess.run(["bash", "-c", cmd], cwd=cwd, capture_output=True, text=True)
+
+def _finish_loop(args, err, rc, result, wt, root, passes, tool_calls):
+    if result is None:
+        return rc
+    result["exit_code"] = rc
+    result["passes"] = passes
+    result["tool_calls"] = tool_calls
+    diff = stat = ""
+    if wt and (args.diff or args.json or args.apply):
+        diff, stat = worktree_diff(wt)
+    if args.apply and wt and rc == EXIT_OK:
+        if not apply_diff(root, diff, err):
+            rc = EXIT_ERR
+            result["exit_code"] = rc
+    emit(args, result, wt, diff, stat)
+    return rc
+
+def run_loop(args, prompt, err):
+    dirs = run_dir(args, err)
+    _, _, root = dirs
+    passes = 0
+    stalls = 0
+    last_prog = None
+    resume_id = None
+    total_tool_calls = 0
+    cur_prompt = prompt
+    while True:
+        rc, result, wt, cwd = _one_pass(args, cur_prompt, resume_id, err, reuse_wt=dirs)
+        passes += 1
+        if result is not None:
+            total_tool_calls += result.get("tool_calls", 0)
+        if rc != EXIT_OK:
+            return _finish_loop(args, err, rc, result, wt, root, passes, total_tool_calls)
+        chk = _check(args.until, cwd)
+        if chk.returncode == 0:
+            return _finish_loop(args, err, EXIT_OK, result, wt, root, passes, total_tool_calls)
+        if args.progress:
+            p = _check(args.progress, cwd)
+            try:
+                val = int(p.stdout.strip())
+            except ValueError:
+                val = None
+            if last_prog is not None and val is not None and val > last_prog:
+                stalls = 0
+            else:
+                stalls += 1
+            if val is not None:
+                last_prog = val
+            if stalls >= args.max_stalls:
+                return _finish_loop(args, err, EXIT_UNTIL, result, wt, root, passes, total_tool_calls)
+        else:
+            if passes >= args.max_passes:
+                return _finish_loop(args, err, EXIT_UNTIL, result, wt, root, passes, total_tool_calls)
+        if CONTINUE_SUPPORTED:
+            resume_id = result["session_id"]
+            cur_prompt = f"The check failed:\n{chk.stdout}\n{chk.stderr}\nContinue."
+        else:
+            resume_id = None
+            cur_prompt = (f"{prompt}\n\nPrevious answer:\n{result.get('answer', '')}\n\n"
+                          f"The check failed:\n{chk.stdout}\n{chk.stderr}\nContinue.")
 
 def finish_pty(proc):
     try:
@@ -396,7 +502,7 @@ def emit(args, result, wt, diff, stat):
     if args.diff and diff:
         sys.stdout.write("\n" + diff)
 
-def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
+def drive(proc, args, prompt, chatdir, deadline, err, start):
     send_prompt(proc, chatdir, prompt, deadline, err)
     tracer = TailTracer(chatdir, start, args.trace)
     state = wait_complete(chatdir, deadline, proc, tracer)
@@ -413,12 +519,6 @@ def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
         msg = last_ai(chatdir)
         answer = extract_answer(msg) if msg else ""
         rc = EXIT_OK
-    diff = stat = ""
-    if wt and (args.diff or args.json or args.apply):
-        diff, stat = worktree_diff(wt)
-    if args.apply and wt and rc == EXIT_OK:
-        if not apply_diff(root, diff, err):
-            rc = EXIT_ERR
     finish_pty(proc)
     result = {
         "answer": answer,
@@ -427,8 +527,7 @@ def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
         "elapsed": time.time() - start,
         "exit_code": rc,
     }
-    emit(args, result, wt, diff, stat)
-    return rc
+    return rc, result
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
