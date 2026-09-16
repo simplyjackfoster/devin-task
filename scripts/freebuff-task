@@ -22,6 +22,20 @@ _LIVE_PROC = None
 
 def _raise_keyboard_interrupt(signum, frame):
     raise KeyboardInterrupt()
+
+class _HardTimeout(Exception):
+    pass
+
+def _make_trace(args, start):
+    """Return a trace(msg) callable that, under --trace, writes a timestamped
+    line to stderr and flushes it immediately. Flushing matters: without it a
+    hung run shows empty stderr because Python block-buffers stderr when it is
+    not a tty (exactly what was seen under systemd-run)."""
+    def tr(msg):
+        if args.trace:
+            sys.stderr.write(f"{PROG}: [{time.time() - start:5.1f}s] {msg}\n")
+            sys.stderr.flush()
+    return tr
 DEFAULT_PREAMBLE = ("There is nobody watching this run. Do not ask questions; "
                     "decide and proceed, or stop. Your final message is the "
                     "answer; put it last.")
@@ -180,6 +194,23 @@ def instance_lock(slot_timeout, err):
     finally:
         fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
 
+@contextmanager
+def hard_timeout(seconds):
+    """Absolute wall-clock backstop via SIGALRM. The per-phase deadlines are
+    cooperative -- they only fire when a loop checks the clock -- so a genuine
+    block in a syscall would run forever and --timeout would never fire (the
+    reported hang). This guarantees the pass is interrupted no matter where it
+    is stuck. Main-thread only, which is where a pass runs."""
+    def _fire(signum, frame):
+        raise _HardTimeout()
+    old = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, max(1.0, seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
 def config_root():
     return os.environ.get("FREEBUFF_CONFIG_DIR") or os.path.expanduser("~/.config/manicode")
 
@@ -237,17 +268,36 @@ class PtyProcess:
         try: os.close(self.fd)
         except OSError: pass
 
-def wait_ready(proc, cwd, before, quiet, deadline):
-    chatdir = None; last_change = time.time(); prev = b""
+def wait_ready(proc, cwd, before, deadline, tr=None, grace=2.0):
+    # Returns (chatdir, status). status is:
+    #   "session" - a new chat-session dir appeared; freebuff is up. chatdir set.
+    #   "settled" - no session dir yet, but the process is alive and has produced
+    #               output and a short settle has passed: freebuff is waiting for
+    #               input and will create the session when the prompt is sent
+    #               (real freebuff creates it lazily). chatdir is None.
+    #   "dead"    - the process exited before becoming usable.
+    #   "deadline"- the deadline passed with no session and no settle.
+    # It deliberately does NOT wait for the screen to fall quiet: a live TUI
+    # redraws continuously and never does, so the old quiet-gate burned the whole
+    # timeout before returning.
+    settle_after = time.time() + grace
+    produced = False
     while time.time() < deadline:
-        proc.read_nonblocking()
-        if chatdir is None:
-            chatdir = new_chat_dir(cwd, before, min(deadline, time.time() + 0.11))
-        if proc.screen != prev:
-            prev = proc.screen; last_change = time.time()
-        if chatdir is not None and time.time() - last_change >= quiet:
-            return chatdir
-    return chatdir
+        if proc.read_nonblocking():
+            produced = True
+        cd = new_chat_dir(cwd, before, min(deadline, time.time() + 0.11))
+        if cd:
+            if tr: tr(f"ready: session dir {os.path.basename(cd)} appeared")
+            return cd, "session"
+        if not proc.alive:
+            if tr: tr("freebuff exited before a session was created")
+            return None, "dead"
+        if produced and time.time() >= settle_after:
+            if tr: tr("ready: TUI settled, no session yet (freebuff creates it on send)")
+            return None, "settled"
+        time.sleep(0.05)
+    if tr: tr("ready-wait hit the deadline with no session dir")
+    return None, "deadline"
 
 SEND_MARKER = "Sending message with sdk run config"
 
@@ -266,22 +316,37 @@ def log_lines(chatdir):
 def _send_landed(chatdir):
     return any(SEND_MARKER in (r.get("msg") or "") for r in log_lines(chatdir))
 
-def send_prompt(proc, chatdir, text, deadline, err):
+def send_prompt(proc, chatdir, cwd, before, text, deadline, err, tr=None):
+    """Paste the prompt and confirm it registered. Returns the chat-session dir:
+    when `chatdir` is None on entry (freebuff creates the session lazily on first
+    input), it is discovered here after the prompt is sent. On genuine failure to
+    register, exits EXIT_EMPTY."""
     payload = b"\x1b[200~" + text.encode() + b"\x1b[201~\r"
     proc.write(payload)
+    if tr: tr("prompt sent")
     sent_deadline = min(deadline, time.time() + 30)
     resent = False
     while time.time() < sent_deadline:
         proc.read_nonblocking()
-        if _send_landed(chatdir):
-            return
+        if chatdir is None:
+            chatdir = new_chat_dir(cwd, before, min(sent_deadline, time.time() + 0.11))
+            if chatdir and tr:
+                tr(f"session dir {os.path.basename(chatdir)} created after send")
+        if chatdir is not None and _send_landed(chatdir):
+            if tr: tr("send registered")
+            return chatdir
         if not proc.alive:
-            # process exited before confirming; let wait_complete/classify handle it
-            return
+            # process exited before confirming; let the caller/classify handle it
+            return chatdir
         if not resent and time.time() - (sent_deadline - 30) > 15:
             proc.write(payload); resent = True
         time.sleep(0.3)
-    err("prompt never registered with freebuff"); sys.exit(EXIT_EMPTY)
+    # Could not confirm the send. Return whatever session we have: a chatdir
+    # (session exists but never registered -> an empty turn, EXIT_EMPTY) or None
+    # (no session was ever created -> not usable, EXIT_ERR). The caller decides,
+    # so a --json object is still emitted instead of a hard sys.exit here.
+    if tr: tr("send never registered within the window")
+    return chatdir
 
 def classify(screen):
     s = screen.lower()
@@ -428,33 +493,46 @@ def _one_pass(args, prompt, resume_id, err, reuse_wt=None):
             argv += ["--continue", resume_id]
         argv += ["--cwd", cwd]
         global _LIVE_PROC
-        proc = PtyProcess().spawn(argv, env)
-        _LIVE_PROC = proc
-        # wait_ready and select_model share a startup bound so a stuck or
-        # unresponsive freebuff still gets killed within --timeout; the run
-        # deadline used for the actual prompt/response is computed fresh
-        # after model selection so that wait isn't deducted from the task's
-        # own wall-clock budget (a prior version starved short --timeout runs).
-        startup_deadline = time.time() + args.timeout
-        chatdir = wait_ready(proc, cwd, before, 0.75, startup_deadline)
-        if not chatdir:
-            alive = proc.alive
-            code = classify(proc.screen.decode(errors="replace"))
-            proc.send_signal(signal.SIGTERM)
-            proc.close()
-            _LIVE_PROC = None
-            if code is not None:
-                err("freebuff hit a known failure screen"); return code, None, wt, cwd
-            err("freebuff never created a chat session within the timeout; "
-                "free-session admission may not have completed"
-                + (" (process still running)" if alive else " (process exited)")
-                + ". Try --no-worktree, or a longer --timeout.")
-            return EXIT_ERR, None, wt, cwd
-        select_model(proc, args.model, startup_deadline)
-        deadline = time.time() + args.timeout
-        rc, result = drive(proc, args, prompt, chatdir, deadline, err, start)
-        result["resume"] = resume
-        return rc, result, wt, cwd
+        tr = _make_trace(args, start)
+        # One whole-pass deadline: startup, model selection, send and response
+        # all share it, so --timeout bounds the pass as documented (a prior
+        # version gave startup and drive a fresh budget each, so a pass could run
+        # ~2x --timeout). A SIGALRM backstop guarantees termination even if a
+        # syscall blocks and no cooperative loop gets to check the clock.
+        deadline = start + args.timeout
+        try:
+            with hard_timeout(args.timeout + 15):
+                proc = PtyProcess().spawn(argv, env)
+                _LIVE_PROC = proc
+                tr("spawned freebuff, waiting for it to be ready")
+                chatdir, status = wait_ready(proc, cwd, before, deadline, tr)
+                if status in ("dead", "deadline"):
+                    code = classify(proc.screen.decode(errors="replace"))
+                    proc.send_signal(signal.SIGTERM)
+                    proc.close()
+                    _LIVE_PROC = None
+                    if code is not None:
+                        err("freebuff hit a known failure screen")
+                        return code, None, wt, cwd
+                    err("freebuff never became ready within the timeout"
+                        + (" (process exited)" if status == "dead"
+                           else " (still running)")
+                        + ". Try --no-worktree, or a longer --timeout.")
+                    return EXIT_ERR, None, wt, cwd
+                # status == "session" (chatdir set) or "settled" (chatdir None;
+                # freebuff will create the session when the prompt is sent).
+                select_model(proc, args.model, deadline)
+                rc, result = drive(proc, args, prompt, chatdir, cwd, before,
+                                   deadline, err, start, tr)
+                if result is not None:
+                    result["resume"] = resume
+                return rc, result, wt, cwd
+        except _HardTimeout:
+            tr("hard timeout fired; killing freebuff")
+            if _LIVE_PROC is not None:
+                finish_pty(_LIVE_PROC); _LIVE_PROC = None
+            err(f"freebuff exceeded the hard timeout of {args.timeout:.0f}s; killed")
+            return EXIT_TIMEOUT, None, wt, cwd
 
 def emit_failure(args, rc):
     """result was None (freebuff never became usable, e.g. not-ready or a
@@ -592,10 +670,21 @@ def emit(args, result, wt, diff, stat):
     if args.diff and diff:
         sys.stdout.write("\n" + diff)
 
-def drive(proc, args, prompt, chatdir, deadline, err, start):
+def drive(proc, args, prompt, chatdir, cwd, before, deadline, err, start, tr=None):
     full_prompt = f"{args.preamble}\n\n{prompt}" if args.preamble else prompt
-    send_prompt(proc, chatdir, full_prompt, deadline, err)
+    chatdir = send_prompt(proc, chatdir, cwd, before, full_prompt, deadline, err, tr)
+    if chatdir is None:
+        # No session was ever created, even after the prompt: freebuff never
+        # became usable. Report a not-usable failure (result None) so the caller
+        # emits the minimal --json object, matching the not-ready path.
+        finish_pty(proc)
+        code = classify(proc.screen.decode(errors="replace"))
+        rc = code if code is not None else EXIT_ERR
+        err("freebuff never created a chat session, even after the prompt was "
+            "sent. Try --no-worktree, or a longer --timeout.")
+        return rc, None
     tracer = TailTracer(chatdir, start, args.trace)
+    if tr: tr("waiting for the response to complete")
     state = wait_complete(chatdir, deadline, proc, tracer)
     tracer.poll()
     if state == "ask":

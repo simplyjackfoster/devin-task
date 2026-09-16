@@ -217,4 +217,29 @@ else
   bad "worktree project dir wrong: $(ls "$FREEBUFF_CONFIG_DIR/projects" 2>/dev/null | tr '\n' ' ')"
 fi
 
+# Live-TUI readiness: real freebuff redraws continuously (never quiet) and may
+# create its session dir only after the prompt is sent. The driver must not gate
+# readiness on the screen falling quiet.
+# lazychat: session dir appears only after the prompt -> driver settles, sends,
+# then discovers the session. (Old quiet-gate code returned "never ready", rc 1.)
+FAKE_FREEBUFF_SCENARIO=lazychat FAKE_FREEBUFF_ANSWER="lazy-ok" \
+  run_to 40 "$FT" --cwd "$REPO" --answer-only --timeout 25 "hi" >"$WORK/olazy" 2>/dev/null; rc=$?
+[ "$rc" -eq 0 ] && grep -q "lazy-ok" "$WORK/olazy" \
+  && ok "lazy session (created on send) is handled" || bad "lazychat rc=$rc out=$(cat "$WORK/olazy")"
+
+# noisy: session at startup but the TUI never falls quiet. Must return promptly,
+# not burn the whole --timeout. (Old quiet-gate code took ~--timeout seconds.)
+t0=$(date +%s)
+FAKE_FREEBUFF_SCENARIO=noisy FAKE_FREEBUFF_ANSWER="noisy-ok" \
+  run_to 90 "$FT" --cwd "$REPO" --answer-only --timeout 60 "hi" >"$WORK/onoisy" 2>/dev/null; rc=$?
+el=$(( $(date +%s) - t0 ))
+[ "$rc" -eq 0 ] && grep -q "noisy-ok" "$WORK/onoisy" && [ "$el" -lt 20 ] \
+  && ok "live-redraw TUI becomes ready promptly (${el}s, not ~timeout)" \
+  || bad "noisy rc=$rc elapsed=${el}s out=$(cat "$WORK/onoisy")"
+
+# --trace narrates the phases to stderr
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="traced2" \
+  run_to 30 "$FT" --cwd "$REPO" --trace --answer-only "hi" >/dev/null 2>"$WORK/etr"; rc=$?
+grep -q "prompt sent" "$WORK/etr" && ok "--trace narrates phases" || bad "--trace phases: $(cat "$WORK/etr")"
+
 exit $fail
