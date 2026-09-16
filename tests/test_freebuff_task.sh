@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+WORK="$(mktemp -d)"; export FREEBUFF_CONFIG_DIR="$WORK/config"; mkdir -p "$FREEBUFF_CONFIG_DIR"
+export PATH="$ROOT/tests:$PATH"           # fake-freebuff shadows the real one
+REPO="$WORK/repo"; mkdir -p "$REPO"; ( cd "$REPO" && git init -q && git commit -q --allow-empty -m init )
+fail=0; ok(){ echo "ok - $1"; }; bad(){ echo "NOT ok - $1"; fail=1; }
+run_to(){ local s="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+
+# fake writes a transcript the driver can find
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="pong" \
+  "$ROOT/tests/fake-freebuff" --cwd "$REPO" <<<"" >/dev/null 2>&1 || true
+found="$(find "$FREEBUFF_CONFIG_DIR/projects" -name chat-messages.json | head -1)"
+[ -n "$found" ] && grep -q pong "$found" && ok "fake writes transcript" || bad "fake writes transcript"
+
+exit $fail
