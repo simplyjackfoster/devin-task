@@ -51,4 +51,13 @@ found7="$(find "$FREEBUFF_CONFIG_DIR/projects" -name log.jsonl -newer "$WORK/mul
 [ -n "$found7" ] && grep -q "Sending message with sdk run config" "$found7" \
   && ok "multi-line prompt delivered as one message" || bad "multi-line prompt not delivered"
 
+# ask_user scenario -> exit 3 with the question as the answer
+set +e
+FAKE_FREEBUFF_SCENARIO=ask_user run_to 30 "$FT" --cwd "$REPO" --answer-only "go" >"$WORK/o8" 2>/dev/null
+rc=$?; set -e
+[ "$rc" -eq 3 ] && grep -qi "database" "$WORK/o8" && ok "ask_user -> exit 3" || bad "ask_user rc=$rc out=$(cat "$WORK/o8")"
+# interrupted scenario is not treated as complete (times out, never a clean 0 answer)
+set +e; FAKE_FREEBUFF_SCENARIO=interrupted run_to 12 "$FT" --cwd "$REPO" --timeout 5 --answer-only "go" >"$WORK/o8b" 2>/dev/null; rc=$?; set -e
+[ "$rc" -ne 0 ] && ok "interrupted is not a clean success" || bad "interrupted returned 0"
+
 exit $fail

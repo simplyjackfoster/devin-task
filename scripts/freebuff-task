@@ -228,19 +228,55 @@ def send_prompt(proc, chatdir, text, deadline, err):
         time.sleep(0.3)
     err("prompt never registered with freebuff"); sys.exit(EXIT_EMPTY)
 
-def _poll_ai_message(chatdir, deadline):
-    # Task 6/7/8 interim stand-in for wait_complete (added in Task 8); used only
-    # so the pre-existing --diff assertion keeps observing a finished write.
+INTERRUPTED = "[response interrupted]"
+
+def read_messages(chatdir):
     p = os.path.join(chatdir, "chat-messages.json")
-    while time.time() < deadline:
+    for _ in range(3):
         try:
-            data = json.load(open(p))
-            if any(m.get("variant") == "ai" for m in data):
-                return True
-        except (ValueError, FileNotFoundError, OSError):
-            pass
-        time.sleep(0.2)
-    return False
+            return json.load(open(p))
+        except (ValueError, FileNotFoundError):
+            time.sleep(0.1)
+    return []
+
+def last_ai(chatdir):
+    ai = [m for m in read_messages(chatdir) if m.get("variant") == "ai"]
+    return ai[-1] if ai else None
+
+def _texts(msg):
+    return [b for b in msg.get("blocks", []) if b.get("type") == "text"]
+
+def extract_answer(msg):
+    return "\n".join(b.get("content", "") for b in _texts(msg)
+                     if b.get("textType") == "text").strip()
+
+def pending_question(msg):
+    for b in msg.get("blocks", []):
+        if b.get("type") == "ask_user":
+            qs = b.get("questions") or []
+            return "\n".join(qs) if isinstance(qs, list) else str(qs)
+    return None
+
+def _run_finished(chatdir):
+    return any("finished" in (r.get("msg") or "") for r in log_lines(chatdir))
+
+def is_complete(chatdir):
+    msg = last_ai(chatdir)
+    if not msg or not msg.get("isComplete"):
+        return False
+    if any(INTERRUPTED in (b.get("content") or "") for b in _texts(msg)):
+        return False
+    return _run_finished(chatdir)
+
+def wait_complete(chatdir, deadline):
+    while time.time() < deadline:
+        msg = last_ai(chatdir)
+        if msg and pending_question(msg) and msg.get("isComplete"):
+            return "ask"
+        if is_complete(chatdir):
+            return "done"
+        time.sleep(0.5)
+    return "timeout"
 
 def run_once(args, prompt, err):
     with instance_lock(args.slot_timeout, err):
@@ -258,17 +294,30 @@ def run_once(args, prompt, err):
         return rc
 
 def drive(proc, args, prompt, chatdir, wt, deadline, err):
-    # filled in Tasks 8-9; interim: wait for a transcript entry (Task 8
-    # replaces this with wait_complete), and keep emitting the diff (Task 9
-    # replaces this with emit()) so the pre-existing --diff assertion stays green.
+    # filled in Task 9; interim: print the answer/question directly (Task 9
+    # replaces this pair of writes with emit()) so the pre-existing --diff
+    # assertion and this task's --answer-only assertions stay green.
     send_prompt(proc, chatdir, prompt, deadline, err)
-    _poll_ai_message(chatdir, deadline)
+    state = wait_complete(chatdir, deadline)
+    if state == "ask":
+        msg = last_ai(chatdir)
+        answer = pending_question(msg) or ""
+        rc = EXIT_ASK
+    elif state == "timeout":
+        answer = ""
+        rc = EXIT_TIMEOUT
+    else:
+        msg = last_ai(chatdir)
+        answer = extract_answer(msg) if msg else ""
+        rc = EXIT_OK
+    if answer:
+        sys.stdout.write(answer + "\n")
     if args.diff and wt:
         diff, stat = worktree_diff(wt)
         sys.stdout.write(diff)
     proc.send_signal(signal.SIGINT); time.sleep(0.3); proc.send_signal(signal.SIGINT)
     proc.close()
-    return EXIT_OK
+    return rc
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
