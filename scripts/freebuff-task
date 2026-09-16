@@ -105,9 +105,18 @@ def worktree_diff(path):
 def run_dir(args, err):
     root = repo_root(args.cwd or os.getcwd(), args.no_worktree, err)
     if args.no_worktree:
-        return (args.cwd or os.getcwd()), None
+        return (args.cwd or os.getcwd()), None, root
     wt = make_worktree(root, args.keep_worktrees)
-    return wt, wt
+    return wt, wt, root
+
+def apply_diff(root, diff, err):
+    if not diff.strip():
+        return True
+    r = subprocess.run(["git", "-C", root, "apply"], input=diff, text=True, capture_output=True)
+    if r.returncode != 0:
+        err("git apply failed; the diff does not apply cleanly:\n" + r.stderr)
+        return False
+    return True
 
 @contextmanager
 def instance_lock(slot_timeout, err):
@@ -281,7 +290,7 @@ def wait_complete(chatdir, deadline):
 def run_once(args, prompt, err):
     start = time.time()
     with instance_lock(args.slot_timeout, err):
-        cwd, wt = run_dir(args, err)
+        cwd, wt, root = run_dir(args, err)
         before = snapshot_chats(cwd)
         env = dict(os.environ); env["TERM"] = "xterm-256color"
         proc = PtyProcess().spawn(["freebuff", "--cwd", cwd], env)
@@ -290,7 +299,7 @@ def run_once(args, prompt, err):
         if not chatdir:
             proc.send_signal(signal.SIGTERM); proc.close()
             err("freebuff never became ready"); return EXIT_ERR
-        rc = drive(proc, args, prompt, chatdir, wt, deadline, err, start)
+        rc = drive(proc, args, prompt, chatdir, wt, deadline, err, start, root)
         return rc
 
 def finish_pty(proc):
@@ -314,7 +323,7 @@ def emit(args, result, wt, diff, stat):
     if args.diff and diff:
         sys.stdout.write("\n" + diff)
 
-def drive(proc, args, prompt, chatdir, wt, deadline, err, start):
+def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
     send_prompt(proc, chatdir, prompt, deadline, err)
     state = wait_complete(chatdir, deadline)
     if state == "ask":
@@ -329,8 +338,11 @@ def drive(proc, args, prompt, chatdir, wt, deadline, err, start):
         answer = extract_answer(msg) if msg else ""
         rc = EXIT_OK
     diff = stat = ""
-    if wt and (args.diff or args.json):
+    if wt and (args.diff or args.json or args.apply):
         diff, stat = worktree_diff(wt)
+    if args.apply and wt and rc == EXIT_OK:
+        if not apply_diff(root, diff, err):
+            rc = EXIT_ERR
     finish_pty(proc)
     result = {
         "answer": answer,

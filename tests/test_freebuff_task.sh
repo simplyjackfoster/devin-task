@@ -72,4 +72,8 @@ FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="pong" \
 python3 -c "import json; d=json.load(open('$WORK/o9')); assert d['answer']=='pong'; assert d['exit_code']==0; assert 'worktree' in d" \
   && ok "--json shape" || bad "--json: $(cat "$WORK/o9")"
 
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="applied" FAKE_FREEBUFF_WRITE="applied.txt:::yes" \
+  run_to 30 "$FT" --cwd "$REPO" --apply --answer-only "go" >/dev/null 2>&1 || true
+[ -f "$REPO/applied.txt" ] && grep -q yes "$REPO/applied.txt" && ok "--apply writes to real tree" || bad "--apply did not apply"
+
 exit $fail
