@@ -169,3 +169,49 @@ are free may be plan-specific, so `devin models list` is the source of truth
 for your account, not this doc.
 
 Tests: `bash tests/test_devin_task.sh` (123 stub-devin checks plus two live calls).
+
+## Freebuff
+
+`freebuff-task` is a second wrapper in this skill, for Freebuff's CLI instead
+of Devin's. Prefer it when `glm-5.3-flash` fits the task and you want the
+account's unmetered model spent instead of Devin's free tier, or when the task
+edits files and you'd rather not think about `--edit`/`--yolo`: every
+`freebuff-task` run happens in a throwaway `git worktree` cloned from `HEAD`,
+so edits are always safe by default and never touch the real checkout unless
+you ask for them back.
+
+```bash
+freebuff-task "prompt"                        # answer only; worktree diff discarded
+freebuff-task --diff "prompt"                 # print the worktree diff after the answer
+freebuff-task --apply "prompt"                # on exit 0, apply the worktree diff to the real tree
+freebuff-task --cwd ~/proj --answer-only "prompt"
+freebuff-task --json "prompt"                 # {answer, session_id, worktree, branch, diff_stat, exit_code, tool_calls, elapsed}
+freebuff-task --until 'CHECK' --max-passes 8 "prompt"   # loop until check exits 0 (same semantics as devin-task)
+```
+
+The answer+diff+`--apply` workflow: ask for the change, inspect the diff (or
+just re-read the files) before trusting it, then re-run with `--apply` once
+you're satisfied, or hand the printed diff to `git apply` yourself.
+
+Exit codes: 0 ok, 1 driver error, 2 usage, 3 the agent stopped to ask a
+question (the question is the answer), 5 `--until` exhausted, 6 rate limited,
+queued, session exhausted, or no instance slot (retryable), 8 not signed in,
+9 empty turn (no AI message after the send landed), 124 timeout, 143 killed by
+SIGTERM or SIGINT.
+
+Only one `freebuff` process runs on this account at a time. The wrapper takes
+a machine-wide lock before spawning and waits up to `--slot-timeout` (default
+600s, exit 6 on expiry), so concurrent `freebuff-task` calls queue instead of
+colliding — there is no `--max-concurrent` because there is nothing to
+parallelize against.
+
+It drives the real `freebuff` binary end to end in a pty and reads its own
+on-disk transcript for the answer — no API calls, no forged client identity or
+headers. Freebuff's backend refuses direct SDK calls made with its free-mode
+agent definitions (`403 free_mode_cli_required`) and warns that doing so may
+get the account banned, so the wrapper never attempts that.
+
+See [README.md](README.md#freebuff-task) for the full flag table and the
+verified-facts table. Tests: `bash tests/test_freebuff_task.sh` (stub-freebuff
+checks); `tests/test_freebuff_task_live.sh` is opt-in
+(`FREEBUFF_TASK_LIVE=1`) and makes one real call.

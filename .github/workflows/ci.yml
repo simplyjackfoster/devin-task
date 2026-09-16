@@ -24,6 +24,8 @@ jobs:
           bash -n examples/batch/dedupe.sh
           bash -n tests/test_devin_task_acp.sh
           python3 -m py_compile scripts/devin-task-acp
+          python3 -m py_compile scripts/freebuff-task
+          bash -n tests/test_freebuff_task.sh tests/test_freebuff_task_live.sh
 
       - name: Run devin-task test suite (no live calls)
         run: DEVIN_TASK_TEST_NO_LIVE=1 bash tests/test_devin_task.sh
@@ -33,3 +35,6 @@ jobs:
 
       - name: Run examples/batch test suite (no live calls)
         run: bash tests/test_examples_batch.sh
+
+      - name: Run freebuff-task test suite (no live calls)
+        run: bash tests/test_freebuff_task.sh

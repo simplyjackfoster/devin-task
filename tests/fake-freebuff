@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+# tests/fake-freebuff: stand-in for the real freebuff TUI during offline tests.
+import os, sys, json, time, datetime, pathlib, signal, select
+
+def cfg_root():
+    base = os.environ.get("FREEBUFF_CONFIG_DIR") or os.path.expanduser("~/.config/manicode")
+    return pathlib.Path(base)
+
+ESC_START = "\x1b[200~"
+ESC_END = "\x1b[201~"
+
+def read_full_line():
+    """Read one line, and if it opens a bracketed paste, keep reading lines
+    until the closing marker shows up, so a multi-line pasted prompt is
+    reassembled instead of truncated at the first embedded newline."""
+    try:
+        line = sys.stdin.readline()
+    except Exception:
+        return ""
+    if line.startswith(ESC_START):
+        while ESC_END not in line:
+            try:
+                nxt = sys.stdin.readline()
+            except Exception:
+                break
+            if not nxt:
+                break
+            line += nxt
+    return line
+
+def emit_and_read_line():
+    """A live TUI: keep redrawing to stdout while waiting for input, so the
+    driver's screen buffer never falls quiet. Reproduces real freebuff, whose
+    spinner/ads redraw continuously (the old quiet-gate ready-detection burned
+    the whole timeout against this)."""
+    while True:
+        sys.stdout.write("\x1b[2K\rworking " + str(time.time())[-4:])
+        sys.stdout.flush()
+        r, _, _ = select.select([sys.stdin], [], [], 0.1)
+        if r:
+            return read_full_line()
+
+def strip_paste(line):
+    return line.replace(ESC_START, "").replace(ESC_END, "")
+
+def make_chat(cwd):
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S.%f")[:-3] + "Z"
+    chat = cfg_root() / "projects" / pathlib.Path(cwd).name / "chats" / ts
+    chat.mkdir(parents=True, exist_ok=True)
+    log = chat / "log.jsonl"
+    msgs = chat / "chat-messages.json"
+    meta = chat / "chat-meta.json"
+    msgs.write_text("[]"); meta.write_text(json.dumps({"messageCount": 0}))
+    return ts, chat, log, msgs, meta
+
+def main(argv):
+    cwd = os.getcwd()
+    if "--cwd" in argv:
+        cwd = argv[argv.index("--cwd") + 1]
+    scen = os.environ.get("FAKE_FREEBUFF_SCENARIO", "answer")
+    answer = os.environ.get("FAKE_FREEBUFF_ANSWER", "done")
+    delay = float(os.environ.get("FAKE_FREEBUFF_DELAY", "0"))
+
+    if scen == "nochatdir":
+        # never writes a transcript directory at all, so the driver never finds
+        # a chat dir and gives up (result is None).
+        sys.stdout.write("Freebuff ready. Type your message.\n"); sys.stdout.flush()
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        time.sleep(3600)
+
+    # `lazychat` mimics a real freebuff that creates its session dir only after
+    # it receives the first prompt, not at startup. Every other scenario creates
+    # it up front.
+    lazy = scen == "lazychat"
+    if not lazy:
+        ts, chat, log, msgs, meta = make_chat(cwd)
+
+    sys.stdout.write("Freebuff ready. Type your message.\n"); sys.stdout.flush()
+
+    if scen == "neverready":
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        time.sleep(3600)
+
+    # wait for the driver's pasted prompt on stdin (a line)
+    selected_model = None
+    reader = emit_and_read_line if scen == "noisy" else read_full_line
+    line = reader()
+    if line.startswith("/model"):
+        try:
+            selected_model = sys.stdin.readline().strip()
+        except Exception:
+            selected_model = ""
+        if not lazy:
+            meta.write_text(json.dumps({"messageCount": 0, "model": selected_model}))
+        line = reader()
+    prompt = strip_paste(line)
+
+    if lazy:
+        ts, chat, log, msgs, meta = make_chat(cwd)
+        if selected_model is not None:
+            meta.write_text(json.dumps({"messageCount": 0, "model": selected_model}))
+
+    if scen == "notsignedin":
+        sys.stdout.write("Not signed in. Run `freebuff login`.\n"); sys.stdout.flush(); time.sleep(0.2); return
+    if scen == "ratelimited":
+        sys.stdout.write("Rate limited and shared by all users: queues when busy.\n"); sys.stdout.flush(); time.sleep(0.2); return
+    run_id = "run-" + ts
+    with log.open("a") as fh:
+        fh.write(json.dumps({"msg": "[send-message] Sending message with sdk run config",
+                             "data": {"runConfig": {"agent": "base3-free-glm-5-3-flash"}}}) + "\n")
+    if scen == "empty":
+        time.sleep(delay); return
+    if scen == "toolcalls":
+        with log.open("a") as fh:
+            for t, a in (("read_files", "README.md"), ("run_terminal_command", "pytest -q")):
+                fh.write(json.dumps({"type": "tool_call", "runId": run_id, "toolName": t, "input": a}) + "\n")
+    time.sleep(delay)
+    # optionally make a file change so a worktree diff exists
+    w = os.environ.get("FAKE_FREEBUFF_WRITE")
+    if w:
+        path, _, content = w.partition(":::")
+        p = pathlib.Path(cwd) / path; p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content)
+    blocks = [{"type": "text", "content": answer, "textType": "text"}]
+    interrupted = scen == "interrupted"
+    if interrupted:
+        blocks[0]["content"] = answer + "\n[response interrupted]"
+    if scen == "ask_user":
+        blocks = [{"type": "ask_user", "questions": ["Which database?"]},
+                  {"type": "text", "content": "I need to know the database.", "textType": "text"}]
+    msgs.write_text(json.dumps([
+        {"variant": "user", "content": prompt.strip()},
+        {"variant": "ai", "blocks": blocks, "isComplete": not interrupted,
+         "metadata": {}, "timestamp": "now"}]))
+    meta_obj = {"messageCount": 2, "messagesMtimeMs": time.time() * 1000}
+    if selected_model is not None:
+        meta_obj["model"] = selected_model
+    meta.write_text(json.dumps(meta_obj))
+    with log.open("a") as fh:
+        fh.write(json.dumps({"msg": "[send-message] run finished", "runId": run_id, "status": "done"}) + "\n")
+    # idle until the driver sends the exit key(s), then quit
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    sys.stdout.write("\n> "); sys.stdout.flush()
+    try:
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "" or ch == "\x04":  # EOF / Ctrl-D
+                return
+    except Exception:
+        return
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

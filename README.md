@@ -373,14 +373,154 @@ loop ends.
 ## Layout
 
 ```
-SKILL.md              Claude Code skill: when and how Claude should delegate
-scripts/devin-task    the wrapper (bash, no dependencies beyond devin)
-examples/batch/       a worked chunked-batch loop: check.sh, run.sh, dedupe.sh
-tests/                stub-based test suites
-install.sh            symlinks into ~/.claude/skills and ~/.local/bin
+SKILL.md                     Claude Code skill: when and how Claude should delegate
+scripts/devin-task           the devin wrapper (bash, no dependencies beyond devin)
+scripts/freebuff-task        the freebuff wrapper (python3 stdlib only, no deps beyond freebuff)
+examples/batch/              a worked chunked-batch loop: check.sh, run.sh, dedupe.sh
+tests/                       stub-based test suites (plus tests/fake-freebuff, the freebuff stub)
+install.sh                   symlinks into ~/.claude/skills and ~/.local/bin
 ```
 
 MIT.
+
+## freebuff-task
+
+A second wrapper in this repo, for [Freebuff](https://github.com/CodebuffAI/codebuff)'s
+CLI instead of Devin's. Freebuff only ships an interactive TUI with no
+non-interactive mode, so `freebuff-task` drives the real `freebuff` binary in a
+pty and reads the answer back out of the transcript files it writes to
+`~/.config/manicode/projects/<cwd basename>/chats/<timestamp>/`. It does not
+call Freebuff's API directly or forge the CLI's client identity — the backend
+refuses free-mode calls made that way (`403 free_mode_cli_required`) and warns
+of a ban, so the wrapper only ever launches the actual binary.
+
+Every run happens in an isolated `git worktree` cloned from `HEAD` (the
+boundary that stands in for devin-task's `--edit`/`--yolo` escalation), so
+edits are safe by default: nothing reaches the real checkout unless `--apply`
+says so.
+
+```bash
+freebuff-task "prompt"                        # answer only; worktree diff discarded
+freebuff-task --diff "prompt"                 # print the worktree diff after the answer
+freebuff-task --apply "prompt"                # on exit 0, apply the worktree diff to the real tree
+freebuff-task --no-worktree --cwd ~/proj "prompt"   # run in the real tree directly, no isolation
+freebuff-task --answer-only "prompt"
+freebuff-task --json "prompt"                 # {answer, session_id, worktree, branch, diff_stat, exit_code, tool_calls, elapsed}
+freebuff-task --until 'CHECK' --max-passes 8 "prompt"          # loop until check exits 0
+freebuff-task --until 'CHECK' --progress './check.sh --count' "prompt"   # loop until progress stalls
+```
+
+| Flag | Effect |
+|---|---|
+| `--cwd DIR` | repo to work in, default current directory. Must be inside a git repo unless `--no-worktree` |
+| `--no-worktree` | run in the real working tree instead of an isolated one. Off by default |
+| `--apply` | on exit 0, apply the worktree's diff to the real working tree with `git apply`; if it does not apply cleanly, exit 1 (the diff still prints with `--diff`) |
+| `--diff` | print the worktree diff after the answer; ignored when `--answer-only` is also given |
+| `--model M` | Freebuff model, default `glm-5.3-flash`; selected through the TUI's `/model` picker when it differs from `settings.json` |
+| `--timeout S` | whole-run wall clock, default 600; exit 124 |
+| `--slot-timeout S` | how long to wait for the machine-wide instance lock, default 600; exit 6 on expiry |
+| `--preamble T` | prepend standing instructions; also `FREEBUFF_TASK_PREAMBLE` |
+| `--keep-worktrees N` | old worktrees under `$TMPDIR/freebuff-task/` to leave behind, default 3 |
+| `--until CMD` | after each pass run `bash -c CMD` in the run cwd; exit 0 ends the loop, otherwise resume the same conversation with the check's output as the next prompt |
+| `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted. Ignored when `--progress` is given |
+| `--progress CMD` | after each `--until` pass run `bash -c CMD`; it must print one integer. A pass that does not raise it is a stall; while it rises the run is unbounded |
+| `--max-stalls N` | consecutive stalls that end a `--progress` run, default 5; exit 5 |
+| `--answer-only` | print only the final message; wins over `--diff` if both are given |
+| `--json` | print `{answer, session_id, worktree, branch, diff_stat, exit_code, tool_calls, elapsed}`; on a not-ready failure (freebuff never became usable) this is a minimal object with just `exit_code` set and the rest empty/zeroed, so a machine caller still gets a reason |
+| `--trace` | print each tool call as Freebuff logs it, on stderr, as it happens (no periodic heartbeat) |
+| `--summary` | one line on stderr at exit: elapsed seconds, tool-call count, exit code; also `FREEBUFF_TASK_SUMMARY=1` |
+
+Deliberately absent, unlike devin-task: `--edit`/`--yolo` (the worktree is the
+permission boundary, so every run may write), `--allow` (no permission model
+to extend), `--max-concurrent` (Freebuff allows one running instance per
+account; see below), `--retries` (callers retry on exit 6 themselves).
+
+Exit codes: 0 ok, 1 driver error, 2 usage, 3 the agent stopped to ask a
+question (the question is the answer), 5 `--until` exhausted (`--max-passes`,
+or `--max-stalls` under `--progress`), 6 rate limited, queued, session
+refused or exhausted, or no instance slot (retryable), 8 not signed in,
+9 empty turn (no AI message after the send landed), 124 timeout, 143 killed
+by SIGTERM or SIGINT.
+
+### Worktree and `--apply`
+
+`--cwd`'s repo root gets a fresh `git worktree add --detach <tmp> HEAD` before
+every run (pruned to `--keep-worktrees` afterward); Freebuff works there, never
+in your real checkout, so uncommitted changes in the real tree are invisible
+to the run and nothing it does can be lost or clobbered. Ask for the change,
+inspect the diff with `--diff` or by reading the worktree directly, then either
+re-run with `--apply` to `git apply` it onto the real tree, or apply the
+printed diff yourself. `--no-worktree` skips all of this and runs Freebuff
+directly in `--cwd`.
+
+### `--until` loops
+
+Same shape as devin-task's: `--until CMD` re-runs a check after every pass and,
+on failure, resumes the same Freebuff conversation with the check's output as
+the next prompt (`freebuff --continue <chat-id>`), so the model keeps its
+context between passes instead of starting cold. `--max-passes` bounds a job
+of known size; `--progress CMD` (paired with `--max-stalls`) bounds one whose
+size you don't know up front by watching a counter instead of counting passes.
+
+```bash
+freebuff-task --until 'python3 check.py' --max-passes 8 --prompt-file task.md
+```
+
+Only one `freebuff` process runs on this account at a time (see
+[Freebuff CLI facts (verified)](#freebuff-cli-facts-verified)), so the wrapper
+takes a machine-wide lock before every pass and waits up to `--slot-timeout`
+(exit 6 on expiry) rather than trying to run two passes — of this loop or of a
+concurrent `freebuff-task` call — at once.
+
+### Tests
+
+```bash
+bash tests/test_freebuff_task.sh
+```
+
+Drives the wrapper against `tests/fake-freebuff`, a stub that plays back the
+same transcript shapes the real binary writes. Covers: exit codes 0, 1
+(freebuff never became usable, incl. the `--json` shape on that path), 2, 3,
+5 (`--max-passes` and `--progress`/`--max-stalls`), 6, 8, 9 (an empty turn,
+distinct from a genuine 124 timeout), 124, and 143 (SIGINT, with a check that
+the freebuff child is actually gone afterward); the standing preamble being
+sent atomically with the prompt; bracketed-paste of a multi-line prompt
+landing as one message with both lines intact; `--json`'s shape and
+`tool_calls` count; `--trace`'s tool-call lines; `--answer-only` taking
+precedence over `--diff`; `--apply` success, refusal on a conflicting diff,
+and the real tree being untouched either way; `--no-worktree`; worktree
+pruning under `--keep-worktrees`; `/model` selection (both "differs" and "no
+settings.json yet, skip it"); and `--summary`/`FREEBUFF_TASK_SUMMARY`.
+
+Not yet covered: the `neverready`/`notsignedin`-adjacent slow paths that only
+resolve after a fixed internal wait, and the `CONTINUE_SUPPORTED = False`
+fresh-session fallback (both intentionally deferred alongside Task 1's live
+verification, see below).
+
+```bash
+FREEBUFF_TASK_LIVE=1 bash tests/test_freebuff_task_live.sh
+```
+
+Opt-in, off by default (it prints `skip` and exits 0 without the env var): one
+real call against the real account and network, reading a file in a scratch
+repo and checking the answer names its contents.
+
+## Freebuff CLI facts (verified)
+
+`freebuff-task` was built against facts about the real `freebuff` binary
+gathered by probing it non-interactively; a live, interactive pass
+(`.superpowers/sdd/2026-09-16-freebuff-task/TASK1-for-user.md`) confirms or
+corrects them. Until that pass runs, every row below is a best estimate, not a
+verified fact.
+
+| Fact | Current best estimate | Status |
+|---|---|---|
+| Exit key (what cleanly quits the TUI) | Two Ctrl-C 500ms apart, then wait 3s, then SIGTERM the process group, then SIGKILL 3s after that if still alive. Ctrl-D untried as a fallback | assumed — pending live confirmation |
+| `--continue <id>` | Accepts the chat directory name (the transcript folder's timestamp name) and resumes the same conversation with its prior context | assumed — pending live confirmation |
+| Second concurrent `freebuff` instance | Refused, tracked via `freebuff-instance-owner.json` (`{instanceId, pid}`); exact on-screen refusal text unknown | assumed — pending live confirmation |
+| Log record shapes (`log.jsonl`) | Send-landed marker is the literal string `"Sending message with sdk run config"`; the run-finish record's message contains `"finished"`; a tool-call record carries a `toolName` field (or `type: "tool_call"` plus `tool`), optionally with `input` or `args` | assumed — pending live confirmation |
+| Bracketed paste | A prompt sent as `ESC[200~<text>ESC[201~\r` submits atomically on the trailing `\r`, including any embedded newlines, with no early partial-line submit | assumed — pending live confirmation |
+| `/model` picker keys | Typing `/model\r`, a short pause, then the model id and `\r` selects it; matched against `settings.json`'s `freebuffModel` by substring | assumed — pending live confirmation |
 
 ## Experimental: ACP transport
 
