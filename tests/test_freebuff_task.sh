@@ -19,4 +19,12 @@ FT="$ROOT/scripts/freebuff-task"
 set +e; printf '' | "$FT" --cwd "$REPO" >/dev/null 2>&1; rc=$?; set -e
 [ "$rc" -eq 2 ] && ok "empty prompt is usage error 2" || bad "empty prompt rc=$rc"
 
+# worktree is created under $TMPDIR/freebuff-task and a diff is captured
+export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="ok" FAKE_FREEBUFF_WRITE="new.txt:::hello" \
+  "$FT" --cwd "$REPO" --diff --answer-only "hi" >"$WORK/o2" 2>/dev/null || true
+grep -q "new.txt" "$WORK/o2" && ok "diff shows worktree change" || bad "diff missing: $(cat "$WORK/o2")"
+# real checkout untouched
+[ ! -e "$REPO/new.txt" ] && ok "real checkout untouched" || bad "real checkout was written"
+
 exit $fail

@@ -6,6 +6,7 @@ Freebuff writes to ~/.config/manicode/projects/<cwd basename>/chats/<ts>/.
 See docs/superpowers/specs/2026-09-16-freebuff-task-design.md.
 """
 import argparse, json, os, sys
+import subprocess, tempfile, time, shutil, glob
 
 PROG = "freebuff-task"
 EXIT_OK, EXIT_ERR, EXIT_USAGE, EXIT_ASK = 0, 1, 2, 3
@@ -61,8 +62,60 @@ def main(argv):
     from_run = run_once(args, prompt, err)
     return from_run
 
+def _git(root, *a):
+    return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True)
+
+def repo_root(cwd, no_worktree, err):
+    r = _git(cwd, "rev-parse", "--show-toplevel")
+    if r.returncode != 0:
+        if no_worktree:
+            return cwd
+        err("--cwd is not inside a git repo (use --no-worktree to run in place)")
+        sys.exit(EXIT_USAGE)
+    return r.stdout.strip()
+
+def _wt_base():
+    return os.path.join(tempfile.gettempdir(), "freebuff-task")
+
+def remove_old_worktrees(root, keep):
+    base = _wt_base()
+    dirs = sorted(glob.glob(os.path.join(base, "wt-*")), key=os.path.getmtime)
+    for d in dirs[:max(0, len(dirs) - keep)]:
+        _git(root, "worktree", "remove", "--force", d)
+        shutil.rmtree(d, ignore_errors=True)
+
+def make_worktree(root, keep):
+    base = _wt_base(); os.makedirs(base, exist_ok=True)
+    remove_old_worktrees(root, keep)
+    path = os.path.join(base, "wt-" + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
+    r = _git(root, "worktree", "add", "--detach", path, "HEAD")
+    if r.returncode != 0:
+        raise RuntimeError("git worktree add failed: " + r.stderr)
+    return path
+
+def worktree_diff(path):
+    _git(path, "add", "-N", ".")
+    diff = _git(path, "diff").stdout
+    stat = _git(path, "diff", "--stat").stdout
+    return diff, stat
+
+def run_dir(args, err):
+    root = repo_root(args.cwd or os.getcwd(), args.no_worktree, err)
+    if args.no_worktree:
+        return (args.cwd or os.getcwd()), None
+    wt = make_worktree(root, args.keep_worktrees)
+    return wt, wt
+
 def run_once(args, prompt, err):  # replaced/extended by later tasks
-    raise NotImplementedError
+    cwd, wt = run_dir(args, err)
+    # minimal spawn for this task; replaced by pty driver in Task 6
+    env = dict(os.environ)
+    subprocess.run(["freebuff", "--cwd", cwd], input=prompt + "\n",
+                   text=True, capture_output=True, env=env)
+    if args.diff and wt:
+        diff, stat = worktree_diff(wt)
+        sys.stdout.write(diff)
+    return EXIT_OK
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
