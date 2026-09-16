@@ -14,4 +14,9 @@ FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="pong" \
 found="$(find "$FREEBUFF_CONFIG_DIR/projects" -name chat-messages.json | head -1)"
 [ -n "$found" ] && grep -q pong "$found" && ok "fake writes transcript" || bad "fake writes transcript"
 
+FT="$ROOT/scripts/freebuff-task"
+# usage error when no prompt
+set +e; printf '' | "$FT" --cwd "$REPO" >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" -eq 2 ] && ok "empty prompt is usage error 2" || bad "empty prompt rc=$rc"
+
 exit $fail
