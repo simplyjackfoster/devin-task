@@ -38,4 +38,9 @@ set +e; FAKE_FREEBUFF_SCENARIO=answer "$FT" --cwd "$REPO" --slot-timeout 1 "hi" 
 [ "$rc" -eq 6 ] && ok "lock contention exits 6" || bad "lock rc=$rc"
 wait
 
+# driver detects the fake's new chat dir (ready) and does not hang
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="ready-ok" \
+  run_to 30 "$FT" --cwd "$REPO" --answer-only "hi" >"$WORK/o6" 2>/dev/null; rc=$?
+[ "$rc" -eq 0 ] && ok "pty run completes" || bad "pty run rc=$rc: $(cat "$WORK/o6")"
+
 exit $fail

@@ -8,6 +8,7 @@ See docs/superpowers/specs/2026-09-16-freebuff-task-design.md.
 import argparse, json, os, sys
 import subprocess, tempfile, time, shutil, glob
 import fcntl
+import pty, select, struct, termios, signal, errno
 from contextlib import contextmanager
 
 PROG = "freebuff-task"
@@ -127,17 +128,117 @@ def instance_lock(slot_timeout, err):
     finally:
         fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
 
-def run_once(args, prompt, err):  # replaced/extended by later tasks
+def config_root():
+    return os.environ.get("FREEBUFF_CONFIG_DIR") or os.path.expanduser("~/.config/manicode")
+
+def chats_dir(cwd):
+    return os.path.join(config_root(), "projects", os.path.basename(os.path.abspath(cwd)), "chats")
+
+def snapshot_chats(cwd):
+    d = chats_dir(cwd)
+    return set(os.listdir(d)) if os.path.isdir(d) else set()
+
+def new_chat_dir(cwd, before, deadline):
+    d = chats_dir(cwd)
+    while time.time() < deadline:
+        if os.path.isdir(d):
+            new = sorted(set(os.listdir(d)) - before)
+            if new:
+                return os.path.join(d, new[-1])
+        time.sleep(0.1)
+    return None
+
+class PtyProcess:
+    def __init__(self):
+        self.pid = None; self.fd = None; self.screen = b""; self._max = 64 * 1024
+    def spawn(self, argv, env):
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe(argv[0], argv, env)
+            os._exit(127)
+        self.pid, self.fd = pid, fd
+        winsz = struct.pack("HHHH", 24, 80, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsz)
+        return self
+    def read_nonblocking(self):
+        try:
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if r:
+                data = os.read(self.fd, 4096)
+                self.screen = (self.screen + data)[-self._max:]
+                return data
+        except OSError:
+            return b""
+        return b""
+    def write(self, data):
+        os.write(self.fd, data)
+    @property
+    def alive(self):
+        try:
+            pid, _ = os.waitpid(self.pid, os.WNOHANG); return pid == 0
+        except OSError:
+            return False
+    def send_signal(self, sig):
+        try: os.killpg(os.getpgid(self.pid), sig)
+        except OSError: pass
+    def close(self):
+        try: os.close(self.fd)
+        except OSError: pass
+
+def wait_ready(proc, cwd, before, quiet, deadline):
+    chatdir = None; last_change = time.time(); prev = b""
+    while time.time() < deadline:
+        proc.read_nonblocking()
+        if chatdir is None:
+            chatdir = new_chat_dir(cwd, before, min(deadline, time.time() + 0.11))
+        if proc.screen != prev:
+            prev = proc.screen; last_change = time.time()
+        if chatdir is not None and time.time() - last_change >= quiet:
+            return chatdir
+    return chatdir
+
+def _poll_ai_message(chatdir, deadline):
+    # Task 6/7/8 interim stand-in for wait_complete (added in Task 8); used only
+    # so the pre-existing --diff assertion keeps observing a finished write.
+    p = os.path.join(chatdir, "chat-messages.json")
+    while time.time() < deadline:
+        try:
+            data = json.load(open(p))
+            if any(m.get("variant") == "ai" for m in data):
+                return True
+        except (ValueError, FileNotFoundError, OSError):
+            pass
+        time.sleep(0.2)
+    return False
+
+def run_once(args, prompt, err):
     with instance_lock(args.slot_timeout, err):
         cwd, wt = run_dir(args, err)
-        # minimal spawn for this task; replaced by pty driver in Task 6
-        env = dict(os.environ)
-        subprocess.run(["freebuff", "--cwd", cwd], input=prompt + "\n",
-                       text=True, capture_output=True, env=env)
-        if args.diff and wt:
-            diff, stat = worktree_diff(wt)
-            sys.stdout.write(diff)
-        return EXIT_OK
+        before = snapshot_chats(cwd)
+        env = dict(os.environ); env["TERM"] = "xterm-256color"
+        proc = PtyProcess().spawn(["freebuff", "--cwd", cwd], env)
+        deadline = time.time() + args.timeout
+        chatdir = wait_ready(proc, cwd, before, 0.75, deadline)
+        if not chatdir:
+            proc.send_signal(signal.SIGTERM); proc.close()
+            err("freebuff never became ready"); return EXIT_ERR
+        # send + completion wired in Tasks 7-9
+        rc = drive(proc, args, prompt, chatdir, wt, deadline, err)
+        return rc
+
+def drive(proc, args, prompt, chatdir, wt, deadline, err):
+    # filled in Tasks 7-9; interim: raw-send the prompt (Task 7 replaces this
+    # with bracketed-paste send_prompt), wait for a transcript entry (Task 8
+    # replaces this with wait_complete), and keep emitting the diff (Task 9
+    # replaces this with emit()) so the pre-existing --diff assertion stays green.
+    proc.write(prompt.encode() + b"\r")
+    _poll_ai_message(chatdir, deadline)
+    if args.diff and wt:
+        diff, stat = worktree_diff(wt)
+        sys.stdout.write(diff)
+    proc.send_signal(signal.SIGINT); time.sleep(0.3); proc.send_signal(signal.SIGINT)
+    proc.close()
+    return EXIT_OK
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
