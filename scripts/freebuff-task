@@ -290,10 +290,38 @@ def is_complete(chatdir):
         return False
     return _run_finished(chatdir)
 
-def wait_complete(chatdir, deadline, proc=None):
+class TailTracer:
+    def __init__(self, chatdir, start_ts, trace):
+        self.path = os.path.join(chatdir, "log.jsonl"); self.offset = 0
+        self.start = start_ts; self.trace = trace; self.tool_names = []; self.count = 0
+    def poll(self):
+        if not os.path.exists(self.path): return
+        with open(self.path, errors="replace") as fh:
+            fh.seek(self.offset)
+            while True:
+                line = fh.readline()
+                if not line or not line.endswith("\n"): break
+                self.offset = fh.tell()
+                line = line.strip()
+                if not line: continue
+                try: rec = json.loads(line)
+                except ValueError: continue
+                tool = rec.get("toolName")
+                if not tool and rec.get("type") == "tool_call":
+                    tool = rec.get("tool")
+                if tool:
+                    self.count += 1; self.tool_names.append(tool)
+                    if self.trace:
+                        arg = rec.get("input") or rec.get("args") or ""
+                        el = f"{time.time() - self.start:.1f}"
+                        sys.stderr.write(f"{PROG}: [{el}s] {tool} {arg}\n"); sys.stderr.flush()
+
+def wait_complete(chatdir, deadline, proc=None, tracer=None):
     while time.time() < deadline:
         if proc is not None:
             proc.read_nonblocking()
+        if tracer is not None:
+            tracer.poll()
         msg = last_ai(chatdir)
         if msg and pending_question(msg) and msg.get("isComplete"):
             return "ask"
@@ -352,7 +380,9 @@ def emit(args, result, wt, diff, stat):
 
 def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
     send_prompt(proc, chatdir, prompt, deadline, err)
-    state = wait_complete(chatdir, deadline, proc)
+    tracer = TailTracer(chatdir, start, args.trace)
+    state = wait_complete(chatdir, deadline, proc, tracer)
+    tracer.poll()
     if state == "ask":
         msg = last_ai(chatdir)
         answer = pending_question(msg) or ""
@@ -375,7 +405,7 @@ def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
     result = {
         "answer": answer,
         "session_id": os.path.basename(chatdir),
-        "tool_calls": 0,
+        "tool_calls": tracer.count,
         "elapsed": time.time() - start,
         "exit_code": rc,
     }

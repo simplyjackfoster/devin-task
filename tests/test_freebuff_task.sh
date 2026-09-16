@@ -81,4 +81,12 @@ set +e; FAKE_FREEBUFF_SCENARIO=notsignedin run_to 15 "$FT" --cwd "$REPO" "hi" >/
 set +e; FAKE_FREEBUFF_SCENARIO=ratelimited run_to 15 "$FT" --cwd "$REPO" "hi" >/dev/null 2>&1; rc=$?; set -e
 [ "$rc" -eq 6 ] && ok "rate-limited -> exit 6" || bad "ratelimited rc=$rc"
 
+# Task 12: tool_calls counted in --json, --trace prints tool call lines
+FAKE_FREEBUFF_SCENARIO=toolcalls FAKE_FREEBUFF_ANSWER="traced" \
+  run_to 30 "$FT" --cwd "$REPO" --json "go" >"$WORK/o12" 2>"$WORK/e12" || true
+python3 -c "import json; d=json.load(open('$WORK/o12')); assert d['tool_calls']>=2, d" \
+  && ok "tool_calls counted" || bad "tool_calls: $(cat "$WORK/o12")"
+FAKE_FREEBUFF_SCENARIO=toolcalls run_to 30 "$FT" --cwd "$REPO" --trace "go" 2>"$WORK/e12b" >/dev/null || true
+grep -q "read_files" "$WORK/e12b" && ok "--trace prints tool calls" || bad "no trace line"
+
 exit $fail
