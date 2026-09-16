@@ -6,6 +6,31 @@ def cfg_root():
     base = os.environ.get("FREEBUFF_CONFIG_DIR") or os.path.expanduser("~/.config/manicode")
     return pathlib.Path(base)
 
+ESC_START = "\x1b[200~"
+ESC_END = "\x1b[201~"
+
+def read_full_line():
+    """Read one line, and if it opens a bracketed paste, keep reading lines
+    until the closing marker shows up, so a multi-line pasted prompt is
+    reassembled instead of truncated at the first embedded newline."""
+    try:
+        line = sys.stdin.readline()
+    except Exception:
+        return ""
+    if line.startswith(ESC_START):
+        while ESC_END not in line:
+            try:
+                nxt = sys.stdin.readline()
+            except Exception:
+                break
+            if not nxt:
+                break
+            line += nxt
+    return line
+
+def strip_paste(line):
+    return line.replace(ESC_START, "").replace(ESC_END, "")
+
 def main(argv):
     cwd = os.getcwd()
     if "--cwd" in argv:
@@ -13,6 +38,12 @@ def main(argv):
     scen = os.environ.get("FAKE_FREEBUFF_SCENARIO", "answer")
     answer = os.environ.get("FAKE_FREEBUFF_ANSWER", "done")
     delay = float(os.environ.get("FAKE_FREEBUFF_DELAY", "0"))
+    if scen == "nochatdir":
+        # never writes a transcript directory at all, so the driver's
+        # wait_ready never finds a chat dir and gives up (result is None).
+        sys.stdout.write("Freebuff ready. Type your message.\n"); sys.stdout.flush()
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        time.sleep(3600)
     ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%S.%f")[:-3] + "Z"
     chat = cfg_root() / "projects" / pathlib.Path(cwd).name / "chats" / ts
     chat.mkdir(parents=True, exist_ok=True)
@@ -27,21 +58,15 @@ def main(argv):
         time.sleep(3600)
     # wait for the driver's pasted prompt on stdin (a line)
     selected_model = None
-    try:
-        line = sys.stdin.readline()
-    except Exception:
-        line = ""
+    line = read_full_line()
     if line.startswith("/model"):
         try:
             selected_model = sys.stdin.readline().strip()
         except Exception:
             selected_model = ""
         meta.write_text(json.dumps({"messageCount": 0, "model": selected_model}))
-        try:
-            line = sys.stdin.readline()
-        except Exception:
-            line = ""
-    prompt = line
+        line = read_full_line()
+    prompt = strip_paste(line)
     if scen == "notsignedin":
         sys.stdout.write("Not signed in. Run `freebuff login`.\n"); sys.stdout.flush(); time.sleep(0.2); return
     if scen == "ratelimited":

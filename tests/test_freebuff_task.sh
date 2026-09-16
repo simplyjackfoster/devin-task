@@ -22,10 +22,17 @@ set +e; printf '' | "$FT" --cwd "$REPO" >/dev/null 2>&1; rc=$?; set -e
 # worktree is created under $TMPDIR/freebuff-task and a diff is captured
 export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
 FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="ok" FAKE_FREEBUFF_WRITE="new.txt:::hello" \
-  "$FT" --cwd "$REPO" --diff --answer-only "hi" >"$WORK/o2" 2>/dev/null || true
-grep -q "new.txt" "$WORK/o2" && ok "diff shows worktree change" || bad "diff missing: $(cat "$WORK/o2")"
+  "$FT" --cwd "$REPO" --diff "hi" >"$WORK/o2" 2>/dev/null || true
+grep -q "new.txt" "$WORK/o2" && ok "diff shows worktree change (plain mode)" || bad "diff missing: $(cat "$WORK/o2")"
 # real checkout untouched
 [ ! -e "$REPO/new.txt" ] && ok "real checkout untouched" || bad "real checkout was written"
+
+# M4: --answer-only wins over --diff -- prints only the answer, no diff (spec precedence)
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="onlyme" FAKE_FREEBUFF_WRITE="new2.txt:::hello" \
+  "$FT" --cwd "$REPO" --diff --answer-only "hi" >"$WORK/o2b" 2>/dev/null || true
+[ "$(cat "$WORK/o2b")" = "onlyme" ] && ! grep -q "new2.txt" "$WORK/o2b" \
+  && ok "--answer-only wins over --diff (answer only, no diff)" \
+  || bad "--answer-only did not win over --diff: $(cat "$WORK/o2b")"
 
 # a held lock makes a second run give up with exit 6 under a short slot timeout
 python3 - "$WORK" <<'PY' &
@@ -48,17 +55,46 @@ printf 'line one\nline two\n' > "$WORK/multi.txt"
 FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="multi-ok" \
   run_to 30 "$FT" --cwd "$REPO" --prompt-file "$WORK/multi.txt" >"$WORK/o7" 2>/dev/null || true
 found7="$(find "$FREEBUFF_CONFIG_DIR/projects" -name log.jsonl -newer "$WORK/multi.txt" | tail -1)"
+msgs7="$(dirname "$found7")/chat-messages.json"
 [ -n "$found7" ] && grep -q "Sending message with sdk run config" "$found7" \
-  && ok "multi-line prompt delivered as one message" || bad "multi-line prompt not delivered"
+  && grep -q "line one" "$msgs7" && grep -q "line two" "$msgs7" \
+  && ok "multi-line prompt delivered as one atomic message (both lines present)" \
+  || bad "multi-line prompt not delivered atomically: $(cat "$msgs7" 2>/dev/null)"
+
+# preamble is prepended to the prompt in the same atomic message (I1)
+touch "$WORK/marker15"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="preamble-ok" \
+  run_to 30 "$FT" --cwd "$REPO" --answer-only "distinctprompttext15" >"$WORK/o15" 2>/dev/null || true
+found15="$(find "$FREEBUFF_CONFIG_DIR/projects" -name chat-messages.json -newer "$WORK/marker15" | tail -1)"
+[ -n "$found15" ] && grep -q "nobody watching this run" "$found15" && grep -q "distinctprompttext15" "$found15" \
+  && ok "standing preamble is sent with the prompt" \
+  || bad "preamble not sent: $(cat "$found15" 2>/dev/null)"
 
 # ask_user scenario -> exit 3 with the question as the answer
 set +e
 FAKE_FREEBUFF_SCENARIO=ask_user run_to 30 "$FT" --cwd "$REPO" --answer-only "go" >"$WORK/o8" 2>/dev/null
 rc=$?; set -e
 [ "$rc" -eq 3 ] && grep -qi "database" "$WORK/o8" && ok "ask_user -> exit 3" || bad "ask_user rc=$rc out=$(cat "$WORK/o8")"
-# interrupted scenario is not treated as complete (times out, never a clean 0 answer)
+# interrupted scenario is not treated as complete: an AI message exists but
+# never completes, so this is a genuine timeout (124), not an empty turn
 set +e; FAKE_FREEBUFF_SCENARIO=interrupted run_to 12 "$FT" --cwd "$REPO" --timeout 5 --answer-only "go" >"$WORK/o8b" 2>/dev/null; rc=$?; set -e
-[ "$rc" -ne 0 ] && ok "interrupted is not a clean success" || bad "interrupted returned 0"
+[ "$rc" -eq 124 ] && ok "interrupted times out (124)" || bad "interrupted rc=$rc"
+
+# empty turn: send lands but no AI message ever appears -> exit 9, not 124.
+# Runs with no settings.json in place, so this also exercises I4's "skip
+# select_model / don't eat the run deadline when settings.json is absent".
+set +e; FAKE_FREEBUFF_SCENARIO=empty run_to 20 "$FT" --cwd "$REPO" --timeout 8 --answer-only "go" >"$WORK/o8c" 2>/dev/null; rc=$?; set -e
+[ "$rc" -eq 9 ] && ok "empty turn -> exit 9" || bad "empty turn rc=$rc: $(cat "$WORK/o8c")"
+
+# I4: with no settings.json yet, select_model is skipped entirely (no /model driven)
+[ -f "$FREEBUFF_CONFIG_DIR/settings.json" ] && rm -f "$FREEBUFF_CONFIG_DIR/settings.json"
+touch "$WORK/marker17"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="noselect" \
+  run_to 30 "$FT" --cwd "$REPO" --answer-only "go" >"$WORK/o17" 2>/dev/null || true
+found17="$(find "$FREEBUFF_CONFIG_DIR/projects" -name chat-meta.json -newer "$WORK/marker17" | tail -1)"
+[ -n "$found17" ] && ! grep -q '"model"' "$found17" \
+  && ok "no settings.json -> /model skipped" \
+  || bad "select_model ran without settings.json: $(cat "$found17" 2>/dev/null)"
 
 # deferred from Task 3: --answer-only prints the answer
 echo "hi there" > "$WORK/p.txt"
@@ -104,5 +140,65 @@ python3 -c "import json; d=json.load(open('$WORK/o14')); assert d['exit_code']==
 # --until that never succeeds hits max-passes -> exit 5
 set +e; FAKE_FREEBUFF_SCENARIO=answer run_to 60 "$FT" --cwd "$REPO" --until "false" --max-passes 2 "go" >/dev/null 2>&1; rc=$?; set -e
 [ "$rc" -eq 5 ] && ok "--until exhausted -> 5" || bad "exhausted rc=$rc"
+
+# M1: the pass that seeds last_prog is not itself a stall (seed, stall, stall -> 3 passes)
+FAKE_FREEBUFF_SCENARIO=answer run_to 60 "$FT" --cwd "$REPO" \
+  --until "false" --progress "echo 7" --max-stalls 2 --json "go" >"$WORK/o19" 2>/dev/null || true
+python3 -c "import json; d=json.load(open('$WORK/o19')); assert d['passes']==3, d" \
+  && ok "--progress: seeding pass is not a stall" || bad "--progress off-by-one: $(cat "$WORK/o19")"
+
+# I5: SIGINT during a run cleans up the freebuff child and exits 143, not 130
+FAKE_FREEBUFF_DELAY=30 FAKE_FREEBUFF_SCENARIO=answer \
+  "$FT" --cwd "$REPO" --timeout 60 "hi" >"$WORK/o18" 2>"$WORK/e18" &
+pid=$!
+sleep 4
+kill -INT "$pid" 2>/dev/null || true
+set +e
+( sleep 20; kill -9 "$pid" 2>/dev/null ) & watchdog=$!
+wait "$pid"; rc=$?
+kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+set -e
+[ "$rc" -eq 143 ] && ok "SIGINT exits 143, not 130" || bad "SIGINT rc=$rc: $(cat "$WORK/e18" 2>/dev/null)"
+sleep 0.3
+if pgrep -f -- "--cwd $REPO" >/dev/null 2>&1; then bad "freebuff child survived SIGINT"; else ok "freebuff child cleaned up after SIGINT"; fi
+
+# M8: not-ready failure path still emits a minimal, machine-readable --json object
+set +e; FAKE_FREEBUFF_SCENARIO=nochatdir run_to 15 "$FT" --cwd "$REPO" --timeout 3 --json "hi" >"$WORK/o20" 2>/dev/null; rc=$?; set -e
+python3 -c "import json; d=json.load(open('$WORK/o20')); assert d['exit_code']==1, d" \
+  && ok "--json on not-ready failure still emits a reason" || bad "--json not-ready: $(cat "$WORK/o20")"
+
+# M2: --summary and FREEBUFF_TASK_SUMMARY print one line to stderr at exit
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="summed" \
+  run_to 30 "$FT" --cwd "$REPO" --summary --answer-only "go" >"$WORK/o21" 2>"$WORK/e21" || true
+grep -q "^freebuff-task: summary:" "$WORK/e21" && grep -q "exit 0" "$WORK/e21" \
+  && ok "--summary prints one line to stderr" || bad "--summary: $(cat "$WORK/e21")"
+FAKE_FREEBUFF_SCENARIO=answer \
+  FREEBUFF_TASK_SUMMARY=1 run_to 30 "$FT" --cwd "$REPO" --answer-only "go" >/dev/null 2>"$WORK/e22" || true
+grep -q "^freebuff-task: summary:" "$WORK/e22" \
+  && ok "FREEBUFF_TASK_SUMMARY=1 enables the summary line" || bad "env summary: $(cat "$WORK/e22")"
+
+# --no-worktree runs directly in the real tree, no isolation
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="nowt" FAKE_FREEBUFF_WRITE="noworktree.txt:::direct" \
+  run_to 30 "$FT" --cwd "$REPO" --no-worktree --answer-only "hi" >/dev/null 2>&1 || true
+[ -f "$REPO/noworktree.txt" ] && grep -q direct "$REPO/noworktree.txt" \
+  && ok "--no-worktree runs directly in the real tree" || bad "--no-worktree did not run in place"
+
+# worktree pruning keeps at most --keep-worktrees + 1 dirs around
+for i in 1 2 3 4; do
+  FAKE_FREEBUFF_SCENARIO=answer run_to 30 "$FT" --cwd "$REPO" --keep-worktrees 1 --answer-only "hi$i" >/dev/null 2>&1 || true
+done
+n="$(find "$TMPDIR/freebuff-task" -maxdepth 1 -name 'wt-*' -type d | wc -l | tr -d ' ')"
+[ "$n" -le 2 ] && ok "worktree pruning keeps at most keep+1 dirs ($n left)" || bad "worktree pruning left $n dirs"
+
+# --apply refuses a diff that does not apply cleanly, and never touches the real tree
+echo "orig" > "$REPO/conflict.txt"; ( cd "$REPO" && git add conflict.txt && git commit -q -m "add conflict.txt" )
+echo "real-tree-edit" > "$REPO/conflict.txt"   # uncommitted edit that the worktree's diff won't apply over
+set +e
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="conflict" FAKE_FREEBUFF_WRITE="conflict.txt:::worktree-edit" \
+  run_to 30 "$FT" --cwd "$REPO" --apply --diff "hi" >"$WORK/o23" 2>"$WORK/e23"; rc=$?
+set -e
+[ "$rc" -eq 1 ] && grep -q "real-tree-edit" "$REPO/conflict.txt" \
+  && ok "--apply refuses a conflicting diff (rc 1), real tree left untouched" \
+  || bad "--apply refusal: rc=$rc content=$(cat "$REPO/conflict.txt" 2>/dev/null) err=$(cat "$WORK/e23")"
 
 exit $fail

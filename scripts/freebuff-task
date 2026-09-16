@@ -14,6 +14,14 @@ from contextlib import contextmanager
 PROG = "freebuff-task"
 EXIT_OK, EXIT_ERR, EXIT_USAGE, EXIT_ASK = 0, 1, 2, 3
 EXIT_UNTIL, EXIT_RETRY, EXIT_AUTH, EXIT_EMPTY, EXIT_TIMEOUT = 5, 6, 8, 9, 124
+EXIT_KILLED = 143
+
+# Set to the currently-spawned PtyProcess (if any) so a SIGTERM/SIGINT
+# handler can clean up the live freebuff child before this process exits.
+_LIVE_PROC = None
+
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt()
 DEFAULT_PREAMBLE = ("There is nobody watching this run. Do not ask questions; "
                     "decide and proceed, or stop. Your final message is the "
                     "answer; put it last.")
@@ -40,7 +48,8 @@ def parse_args(argv):
     p.add_argument("--answer-only", action="store_true")
     p.add_argument("--json", action="store_true")
     p.add_argument("--trace", action="store_true")
-    p.add_argument("--summary", action="store_true")
+    p.add_argument("--summary", action="store_true",
+                   default=os.environ.get("FREEBUFF_TASK_SUMMARY", "") not in ("", "0"))
     p.add_argument("--until")
     p.add_argument("--max-passes", type=int, default=5)
     p.add_argument("--progress")
@@ -68,10 +77,18 @@ def read_prompt(args, err):
 def main(argv):
     args = parse_args(argv)
     def err(m): sys.stderr.write(f"{PROG}: {m}\n")
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
     prompt = read_prompt(args, err)
-    if args.until:
-        return run_loop(args, prompt, err)
-    return run_once(args, prompt, err)
+    try:
+        if args.until:
+            return run_loop(args, prompt, err)
+        return run_once(args, prompt, err)
+    except KeyboardInterrupt:
+        if _LIVE_PROC is not None:
+            finish_pty(_LIVE_PROC)
+        err("killed by signal")
+        return EXIT_KILLED
 
 def _git(root, *a):
     return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True)
@@ -92,8 +109,12 @@ def remove_old_worktrees(root, keep):
     base = _wt_base()
     dirs = sorted(glob.glob(os.path.join(base, "wt-*")), key=os.path.getmtime)
     for d in dirs[:max(0, len(dirs) - keep)]:
-        _git(root, "worktree", "remove", "--force", d)
-        shutil.rmtree(d, ignore_errors=True)
+        r = _git(root, "worktree", "remove", "--force", d)
+        if r.returncode == 0:
+            shutil.rmtree(d, ignore_errors=True)
+        # else: git refused (e.g. this dir belongs to a different repo's
+        # worktree list) -- leave it alone. rmtree'ing it anyway would strand
+        # a stale entry in that other repo's .git/worktrees.
 
 def make_worktree(root, keep):
     base = _wt_base(); os.makedirs(base, exist_ok=True)
@@ -106,7 +127,7 @@ def make_worktree(root, keep):
 
 def worktree_diff(path):
     _git(path, "add", "-N", ".")
-    diff = _git(path, "diff").stdout
+    diff = _git(path, "diff", "--binary").stdout
     stat = _git(path, "diff", "--stat").stdout
     return diff, stat
 
@@ -341,12 +362,23 @@ def wait_complete(chatdir, deadline, proc=None, tracer=None):
     return "timeout"
 
 def current_model():
+    """Return the model recorded in settings.json's `freebuffModel`, "" if the
+    file exists but doesn't say, or None if settings.json doesn't exist at
+    all (no settings yet == already on the default, so callers should treat
+    that as "nothing to change" rather than driving the /model picker)."""
     p = os.path.join(config_root(), "settings.json")
-    try: return json.load(open(p)).get("freebuffModel", "")
-    except Exception: return ""
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return ""
+    return data.get("freebuffModel", "")
 
 def select_model(proc, model, deadline):
-    if not model or model in current_model():
+    cur = current_model()
+    if not model or cur is None or model in cur:
         return
     proc.write(b"/model\r"); time.sleep(0.5)
     proc.write(model.encode() + b"\r")
@@ -381,26 +413,53 @@ def _one_pass(args, prompt, resume_id, err, reuse_wt=None):
         if resume == "continue":
             argv += ["--continue", resume_id]
         argv += ["--cwd", cwd]
+        global _LIVE_PROC
         proc = PtyProcess().spawn(argv, env)
-        deadline = time.time() + args.timeout
-        chatdir = wait_ready(proc, cwd, before, 0.75, deadline)
+        _LIVE_PROC = proc
+        # wait_ready and select_model share a startup bound so a stuck or
+        # unresponsive freebuff still gets killed within --timeout; the run
+        # deadline used for the actual prompt/response is computed fresh
+        # after model selection so that wait isn't deducted from the task's
+        # own wall-clock budget (a prior version starved short --timeout runs).
+        startup_deadline = time.time() + args.timeout
+        chatdir = wait_ready(proc, cwd, before, 0.75, startup_deadline)
         if not chatdir:
             proc.send_signal(signal.SIGTERM)
             code = classify(proc.screen.decode(errors="replace"))
             proc.close()
+            _LIVE_PROC = None
             if code is not None:
                 err("freebuff hit a known failure screen"); return code, None, wt, cwd
             err("freebuff never became ready"); return EXIT_ERR, None, wt, cwd
-        select_model(proc, args.model, deadline)
+        select_model(proc, args.model, startup_deadline)
+        deadline = time.time() + args.timeout
         rc, result = drive(proc, args, prompt, chatdir, deadline, err, start)
         result["resume"] = resume
         return rc, result, wt, cwd
 
+def emit_failure(args, rc):
+    """result was None (freebuff never became usable, e.g. not-ready or a
+    known failure screen). A --json caller still gets a minimal, well-shaped
+    object with a reason instead of empty stdout."""
+    if args.json:
+        obj = {"answer": "", "session_id": "", "worktree": "", "branch": "",
+               "diff_stat": "", "tool_calls": 0, "elapsed": 0.0, "exit_code": rc}
+        sys.stdout.write(json.dumps(obj) + "\n")
+
+def print_summary(args, err, elapsed, tool_calls, rc):
+    if not args.summary:
+        return
+    err(f"summary: {elapsed:.1f}s elapsed, {tool_calls} tool call(s), exit {rc}")
+
 def run_once(args, prompt, err):
-    dirs = run_dir(args, err)
+    run_start = time.time()
+    with instance_lock(args.slot_timeout, err):
+        dirs = run_dir(args, err)
     _, _, root = dirs
     rc, result, wt, cwd = _one_pass(args, prompt, None, err, reuse_wt=dirs)
     if result is None:
+        emit_failure(args, rc)
+        print_summary(args, err, time.time() - run_start, 0, rc)
         return rc
     diff = stat = ""
     if wt and (args.diff or args.json or args.apply):
@@ -410,13 +469,16 @@ def run_once(args, prompt, err):
             rc = EXIT_ERR
             result["exit_code"] = rc
     emit(args, result, wt, diff, stat)
+    print_summary(args, err, time.time() - run_start, result.get("tool_calls", 0), rc)
     return rc
 
 def _check(cmd, cwd):
     return subprocess.run(["bash", "-c", cmd], cwd=cwd, capture_output=True, text=True)
 
-def _finish_loop(args, err, rc, result, wt, root, passes, tool_calls):
+def _finish_loop(args, err, rc, result, wt, root, passes, tool_calls, run_start):
     if result is None:
+        emit_failure(args, rc)
+        print_summary(args, err, time.time() - run_start, tool_calls, rc)
         return rc
     result["exit_code"] = rc
     result["passes"] = passes
@@ -429,10 +491,13 @@ def _finish_loop(args, err, rc, result, wt, root, passes, tool_calls):
             rc = EXIT_ERR
             result["exit_code"] = rc
     emit(args, result, wt, diff, stat)
+    print_summary(args, err, time.time() - run_start, tool_calls, rc)
     return rc
 
 def run_loop(args, prompt, err):
-    dirs = run_dir(args, err)
+    run_start = time.time()
+    with instance_lock(args.slot_timeout, err):
+        dirs = run_dir(args, err)
     _, _, root = dirs
     passes = 0
     stalls = 0
@@ -446,27 +511,30 @@ def run_loop(args, prompt, err):
         if result is not None:
             total_tool_calls += result.get("tool_calls", 0)
         if rc != EXIT_OK:
-            return _finish_loop(args, err, rc, result, wt, root, passes, total_tool_calls)
+            return _finish_loop(args, err, rc, result, wt, root, passes, total_tool_calls, run_start)
         chk = _check(args.until, cwd)
         if chk.returncode == 0:
-            return _finish_loop(args, err, EXIT_OK, result, wt, root, passes, total_tool_calls)
+            return _finish_loop(args, err, EXIT_OK, result, wt, root, passes, total_tool_calls, run_start)
         if args.progress:
             p = _check(args.progress, cwd)
             try:
                 val = int(p.stdout.strip())
             except ValueError:
                 val = None
+            first_progress_pass = last_prog is None
             if last_prog is not None and val is not None and val > last_prog:
                 stalls = 0
-            else:
+            elif not first_progress_pass:
+                # only count a stall once a baseline exists; the pass that
+                # seeds last_prog is not itself a stall
                 stalls += 1
             if val is not None:
                 last_prog = val
             if stalls >= args.max_stalls:
-                return _finish_loop(args, err, EXIT_UNTIL, result, wt, root, passes, total_tool_calls)
+                return _finish_loop(args, err, EXIT_UNTIL, result, wt, root, passes, total_tool_calls, run_start)
         else:
             if passes >= args.max_passes:
-                return _finish_loop(args, err, EXIT_UNTIL, result, wt, root, passes, total_tool_calls)
+                return _finish_loop(args, err, EXIT_UNTIL, result, wt, root, passes, total_tool_calls, run_start)
         if CONTINUE_SUPPORTED:
             resume_id = result["session_id"]
             cur_prompt = f"The check failed:\n{chk.stdout}\n{chk.stderr}\nContinue."
@@ -476,6 +544,7 @@ def run_loop(args, prompt, err):
                           f"The check failed:\n{chk.stdout}\n{chk.stderr}\nContinue.")
 
 def finish_pty(proc):
+    global _LIVE_PROC
     try:
         if proc.alive:
             proc.write(b"\x03"); time.sleep(0.5)
@@ -486,6 +555,8 @@ def finish_pty(proc):
     if proc.alive: proc.send_signal(signal.SIGTERM); time.sleep(3)
     if proc.alive: proc.send_signal(signal.SIGKILL)
     proc.close()
+    if _LIVE_PROC is proc:
+        _LIVE_PROC = None
 
 def emit(args, result, wt, diff, stat):
     if args.json:
@@ -494,16 +565,17 @@ def emit(args, result, wt, diff, stat):
         obj["diff_stat"] = stat or ""
         sys.stdout.write(json.dumps(obj) + "\n"); return
     if args.answer_only:
+        # --answer-only means only the answer, full stop: it wins over
+        # --diff even when both are given (spec precedence).
         sys.stdout.write(result["answer"] + "\n")
-        if args.diff and diff:
-            sys.stdout.write(diff)
         return
     sys.stdout.write(result["answer"] + "\n")
     if args.diff and diff:
         sys.stdout.write("\n" + diff)
 
 def drive(proc, args, prompt, chatdir, deadline, err, start):
-    send_prompt(proc, chatdir, prompt, deadline, err)
+    full_prompt = f"{args.preamble}\n\n{prompt}" if args.preamble else prompt
+    send_prompt(proc, chatdir, full_prompt, deadline, err)
     tracer = TailTracer(chatdir, start, args.trace)
     state = wait_complete(chatdir, deadline, proc, tracer)
     tracer.poll()
@@ -514,7 +586,15 @@ def drive(proc, args, prompt, chatdir, deadline, err, start):
     elif state == "timeout":
         answer = ""
         code = classify(proc.screen.decode(errors="replace"))
-        rc = code if code is not None else EXIT_TIMEOUT
+        if code is not None:
+            rc = code
+        elif last_ai(chatdir) is None:
+            # the send landed but no AI message ever showed up: an empty
+            # turn, distinct from a genuine timeout where an AI message
+            # exists but never completed (that stays EXIT_TIMEOUT).
+            rc = EXIT_EMPTY
+        else:
+            rc = EXIT_TIMEOUT
     else:
         msg = last_ai(chatdir)
         answer = extract_answer(msg) if msg else ""
