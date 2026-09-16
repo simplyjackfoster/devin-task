@@ -197,6 +197,37 @@ def wait_ready(proc, cwd, before, quiet, deadline):
             return chatdir
     return chatdir
 
+SEND_MARKER = "Sending message with sdk run config"
+
+def log_lines(chatdir):
+    p = os.path.join(chatdir, "log.jsonl")
+    out = []
+    if not os.path.exists(p): return out
+    with open(p, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line: continue
+            try: out.append(json.loads(line))
+            except ValueError: pass
+    return out
+
+def _send_landed(chatdir):
+    return any(SEND_MARKER in (r.get("msg") or "") for r in log_lines(chatdir))
+
+def send_prompt(proc, chatdir, text, deadline, err):
+    payload = b"\x1b[200~" + text.encode() + b"\x1b[201~\r"
+    proc.write(payload)
+    sent_deadline = min(deadline, time.time() + 30)
+    resent = False
+    while time.time() < sent_deadline:
+        proc.read_nonblocking()
+        if _send_landed(chatdir):
+            return
+        if not resent and time.time() - (sent_deadline - 30) > 15:
+            proc.write(payload); resent = True
+        time.sleep(0.3)
+    err("prompt never registered with freebuff"); sys.exit(EXIT_EMPTY)
+
 def _poll_ai_message(chatdir, deadline):
     # Task 6/7/8 interim stand-in for wait_complete (added in Task 8); used only
     # so the pre-existing --diff assertion keeps observing a finished write.
@@ -227,11 +258,10 @@ def run_once(args, prompt, err):
         return rc
 
 def drive(proc, args, prompt, chatdir, wt, deadline, err):
-    # filled in Tasks 7-9; interim: raw-send the prompt (Task 7 replaces this
-    # with bracketed-paste send_prompt), wait for a transcript entry (Task 8
+    # filled in Tasks 8-9; interim: wait for a transcript entry (Task 8
     # replaces this with wait_complete), and keep emitting the diff (Task 9
     # replaces this with emit()) so the pre-existing --diff assertion stays green.
-    proc.write(prompt.encode() + b"\r")
+    send_prompt(proc, chatdir, prompt, deadline, err)
     _poll_ai_message(chatdir, deadline)
     if args.diff and wt:
         diff, stat = worktree_diff(wt)

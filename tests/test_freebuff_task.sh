@@ -43,4 +43,12 @@ FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="ready-ok" \
   run_to 30 "$FT" --cwd "$REPO" --answer-only "hi" >"$WORK/o6" 2>/dev/null; rc=$?
 [ "$rc" -eq 0 ] && ok "pty run completes" || bad "pty run rc=$rc: $(cat "$WORK/o6")"
 
+# multi-line prompt is delivered as one message (send-landed log line appears)
+printf 'line one\nline two\n' > "$WORK/multi.txt"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="multi-ok" \
+  run_to 30 "$FT" --cwd "$REPO" --prompt-file "$WORK/multi.txt" >"$WORK/o7" 2>/dev/null || true
+found7="$(find "$FREEBUFF_CONFIG_DIR/projects" -name log.jsonl -newer "$WORK/multi.txt" | tail -1)"
+[ -n "$found7" ] && grep -q "Sending message with sdk run config" "$found7" \
+  && ok "multi-line prompt delivered as one message" || bad "multi-line prompt not delivered"
+
 exit $fail
