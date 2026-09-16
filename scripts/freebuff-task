@@ -279,6 +279,7 @@ def wait_complete(chatdir, deadline):
     return "timeout"
 
 def run_once(args, prompt, err):
+    start = time.time()
     with instance_lock(args.slot_timeout, err):
         cwd, wt = run_dir(args, err)
         before = snapshot_chats(cwd)
@@ -289,14 +290,31 @@ def run_once(args, prompt, err):
         if not chatdir:
             proc.send_signal(signal.SIGTERM); proc.close()
             err("freebuff never became ready"); return EXIT_ERR
-        # send + completion wired in Tasks 7-9
-        rc = drive(proc, args, prompt, chatdir, wt, deadline, err)
+        rc = drive(proc, args, prompt, chatdir, wt, deadline, err, start)
         return rc
 
-def drive(proc, args, prompt, chatdir, wt, deadline, err):
-    # filled in Task 9; interim: print the answer/question directly (Task 9
-    # replaces this pair of writes with emit()) so the pre-existing --diff
-    # assertion and this task's --answer-only assertions stay green.
+def finish_pty(proc):
+    proc.write(b"\x03"); time.sleep(0.5); proc.write(b"\x03"); time.sleep(3)
+    if proc.alive: proc.send_signal(signal.SIGTERM); time.sleep(3)
+    if proc.alive: proc.send_signal(signal.SIGKILL)
+    proc.close()
+
+def emit(args, result, wt, diff, stat):
+    if args.json:
+        obj = dict(result); obj["worktree"] = wt or ""
+        obj["branch"] = ""  # detached worktree; no branch
+        obj["diff_stat"] = stat or ""
+        sys.stdout.write(json.dumps(obj) + "\n"); return
+    if args.answer_only:
+        sys.stdout.write(result["answer"] + "\n")
+        if args.diff and diff:
+            sys.stdout.write(diff)
+        return
+    sys.stdout.write(result["answer"] + "\n")
+    if args.diff and diff:
+        sys.stdout.write("\n" + diff)
+
+def drive(proc, args, prompt, chatdir, wt, deadline, err, start):
     send_prompt(proc, chatdir, prompt, deadline, err)
     state = wait_complete(chatdir, deadline)
     if state == "ask":
@@ -310,13 +328,18 @@ def drive(proc, args, prompt, chatdir, wt, deadline, err):
         msg = last_ai(chatdir)
         answer = extract_answer(msg) if msg else ""
         rc = EXIT_OK
-    if answer:
-        sys.stdout.write(answer + "\n")
-    if args.diff and wt:
+    diff = stat = ""
+    if wt and (args.diff or args.json):
         diff, stat = worktree_diff(wt)
-        sys.stdout.write(diff)
-    proc.send_signal(signal.SIGINT); time.sleep(0.3); proc.send_signal(signal.SIGINT)
-    proc.close()
+    finish_pty(proc)
+    result = {
+        "answer": answer,
+        "session_id": os.path.basename(chatdir),
+        "tool_calls": 0,
+        "elapsed": time.time() - start,
+        "exit_code": rc,
+    }
+    emit(args, result, wt, diff, stat)
     return rc
 
 if __name__ == "__main__":

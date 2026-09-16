@@ -60,4 +60,16 @@ rc=$?; set -e
 set +e; FAKE_FREEBUFF_SCENARIO=interrupted run_to 12 "$FT" --cwd "$REPO" --timeout 5 --answer-only "go" >"$WORK/o8b" 2>/dev/null; rc=$?; set -e
 [ "$rc" -ne 0 ] && ok "interrupted is not a clean success" || bad "interrupted returned 0"
 
+# deferred from Task 3: --answer-only prints the answer
+echo "hi there" > "$WORK/p.txt"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="pong" \
+  run_to 30 "$FT" --cwd "$REPO" --prompt-file "$WORK/p.txt" --answer-only >"$WORK/o1" 2>/dev/null || true
+grep -q pong "$WORK/o1" && ok "answer-only prints answer" || bad "answer-only: $(cat "$WORK/o1")"
+
+# --json shape: answer, exit_code, worktree key
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="pong" \
+  run_to 30 "$FT" --cwd "$REPO" --json "hi" >"$WORK/o9" 2>/dev/null || true
+python3 -c "import json; d=json.load(open('$WORK/o9')); assert d['answer']=='pong'; assert d['exit_code']==0; assert 'worktree' in d" \
+  && ok "--json shape" || bad "--json: $(cat "$WORK/o9")"
+
 exit $fail
