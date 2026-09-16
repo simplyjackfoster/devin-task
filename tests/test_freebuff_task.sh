@@ -201,4 +201,20 @@ set -e
   && ok "--apply refuses a conflicting diff (rc 1), real tree left untouched" \
   || bad "--apply refusal: rc=$rc content=$(cat "$REPO/conflict.txt" 2>/dev/null) err=$(cat "$WORK/e23")"
 
+# A worktree run reuses the real repo's project identity: freebuff's project dir
+# is keyed on basename(cwd), so the worktree leaf is named after the repo. This
+# shares the already-admitted project instead of minting a fresh per-worktree one
+# (which never cleared free-session admission under an automated pty run). The
+# transcript must land under projects/<repo-basename>/, and no projects/wt-* dir
+# may be created.
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="proj" \
+  run_to 60 "$FT" --cwd "$REPO" --answer-only "hi" >/dev/null 2>&1 || true
+if [ -d "$FREEBUFF_CONFIG_DIR/projects/$(basename "$REPO")/chats" ] \
+   && [ -z "$(find "$FREEBUFF_CONFIG_DIR/projects" -maxdepth 1 -type d -name 'wt-*' 2>/dev/null)" ]; then
+  ok "worktree run reuses the real repo's project dir"
+else
+  bad "worktree project dir wrong: $(ls "$FREEBUFF_CONFIG_DIR/projects" 2>/dev/null | tr '\n' ' ')"
+fi
+
 exit $fail

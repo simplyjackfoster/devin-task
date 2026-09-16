@@ -106,20 +106,34 @@ def _wt_base():
     return os.path.join(tempfile.gettempdir(), "freebuff-task")
 
 def remove_old_worktrees(root, keep):
+    # Prune only parents that actually hold THIS repo's worktree leaf
+    # (<base>/wt-*/<repo-basename>), so another repo's worktrees are never
+    # touched. Glob the filesystem rather than `git worktree list` -- git
+    # canonicalizes stored paths through symlinks (e.g. macOS /var -> /private),
+    # which would not match our base dir and would prune nothing.
     base = _wt_base()
-    dirs = sorted(glob.glob(os.path.join(base, "wt-*")), key=os.path.getmtime)
-    for d in dirs[:max(0, len(dirs) - keep)]:
-        r = _git(root, "worktree", "remove", "--force", d)
-        if r.returncode == 0:
+    leaf = os.path.basename(os.path.abspath(root))
+    mine = [d for d in glob.glob(os.path.join(base, "wt-*"))
+            if os.path.isdir(os.path.join(d, leaf))]
+    mine.sort(key=os.path.getmtime)
+    for d in mine[:max(0, len(mine) - keep)]:
+        wt = os.path.join(d, leaf)
+        if _git(root, "worktree", "remove", "--force", wt).returncode == 0:
             shutil.rmtree(d, ignore_errors=True)
-        # else: git refused (e.g. this dir belongs to a different repo's
-        # worktree list) -- leave it alone. rmtree'ing it anyway would strand
-        # a stale entry in that other repo's .git/worktrees.
 
 def make_worktree(root, keep):
     base = _wt_base(); os.makedirs(base, exist_ok=True)
     remove_old_worktrees(root, keep)
-    path = os.path.join(base, "wt-" + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
+    # The worktree leaf is named after the real repo. Freebuff keys its project
+    # dir (~/.config/manicode/projects/<basename>) on basename(cwd), so a leaf
+    # named after the repo shares the real checkout's already-admitted project
+    # instead of minting a brand-new one each run. A per-run project never
+    # cleared free-session admission under an automated pty run, so no chat
+    # session was created and the run timed out. The unique run id is the parent
+    # dir, keeping worktree paths distinct.
+    parent = os.path.join(base, "wt-" + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}")
+    os.makedirs(parent, exist_ok=True)
+    path = os.path.join(parent, os.path.basename(os.path.abspath(root)))
     r = _git(root, "worktree", "add", "--detach", path, "HEAD")
     if r.returncode != 0:
         raise RuntimeError("git worktree add failed: " + r.stderr)
@@ -424,13 +438,18 @@ def _one_pass(args, prompt, resume_id, err, reuse_wt=None):
         startup_deadline = time.time() + args.timeout
         chatdir = wait_ready(proc, cwd, before, 0.75, startup_deadline)
         if not chatdir:
-            proc.send_signal(signal.SIGTERM)
+            alive = proc.alive
             code = classify(proc.screen.decode(errors="replace"))
+            proc.send_signal(signal.SIGTERM)
             proc.close()
             _LIVE_PROC = None
             if code is not None:
                 err("freebuff hit a known failure screen"); return code, None, wt, cwd
-            err("freebuff never became ready"); return EXIT_ERR, None, wt, cwd
+            err("freebuff never created a chat session within the timeout; "
+                "free-session admission may not have completed"
+                + (" (process still running)" if alive else " (process exited)")
+                + ". Try --no-worktree, or a longer --timeout.")
+            return EXIT_ERR, None, wt, cwd
         select_model(proc, args.model, startup_deadline)
         deadline = time.time() + args.timeout
         rc, result = drive(proc, args, prompt, chatdir, deadline, err, start)

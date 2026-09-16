@@ -64,6 +64,9 @@ Keys: `answer`, `session_id`, `worktree`, `branch`, `diff_stat`, `tool_calls`,
 - Requires a logged-in Freebuff (`~/.config/manicode`) with onboarding cleared. If
   you get exit 8, surface it to a human; do not try to authenticate.
 - It runs the genuine Freebuff CLI. It does not call any API or forge identity.
+- A worktree run shares the real repo's Freebuff project identity (the worktree
+  leaf is named after the repo), so it reuses the repo's already-admitted
+  free session. If a run still stalls at admission, use `--no-worktree`.
 
 ## Typical patterns
 Review before applying:
