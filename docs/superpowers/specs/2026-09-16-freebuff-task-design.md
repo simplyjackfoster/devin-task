@@ -85,17 +85,29 @@ printf '%s' "$PROMPT" | freebuff-task [flags]
 | `--keep-worktrees N` | old worktrees to leave behind, default 3; older ones are removed at the start of a run. |
 | `--answer-only` | print only the final message. |
 | `--json` | print `{answer, session_id, worktree, branch, diff_stat, exit_code, tool_calls, elapsed}`. |
-| `--trace` | live tool calls and state transitions on stderr. |
+| `--trace` | live on stderr: driver state transitions, and every tool call as Freebuff logs it (tailed from `log.jsonl`, see below). |
 | `--summary` | one line on stderr at exit (env `FREEBUFF_TASK_SUMMARY=1`). |
 
 Exit codes: 0 ok, 1 driver error, 2 usage, 3 the agent stopped to ask a
-question (the question is the answer), 6 rate limited, queued, session refused or
+question (the question is the answer), 5 `--until` exhausted, 6 rate limited, queued, session refused or
 exhausted, or no instance slot (retryable), 8 not signed in, 9 empty turn (no AI
 message after the send landed), 124 timeout, 143 killed by SIGTERM or SIGINT.
 
+| `--until CMD` | after each pass run `bash -c CMD` in the run cwd; exit 0 ends the loop, otherwise resume the same Freebuff conversation with the check's output as the next prompt. Same semantics as devin-task. |
+| `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted. Ignored when `--progress` is given. |
+| `--progress CMD` | after each `--until` pass run `bash -c CMD`; it prints one integer. A pass that does not raise it is a stall; while it rises the run is unbounded. |
+| `--max-stalls N` | consecutive stalls that end a `--progress` run, default 5; exit 5. |
+
 Deliberately absent: `--edit`, `--yolo`, `--allow` (no permission model; the
-worktree is the boundary), `--max-concurrent` (one instance), `--until` and
-`--progress` (later, on top of `--continue`), `--retries` (callers retry on 6).
+worktree is the boundary), `--max-concurrent` (one instance), `--retries`
+(callers retry on 6).
+
+`--until` resumes a conversation with `freebuff --continue <id> --cwd <run cwd>`,
+so the agent keeps its context between passes as it does under devin-task. This
+depends on `--continue` accepting the chat directory name (verification item 2).
+If it does not, the fallback is a fresh session per pass whose prompt carries the
+previous answer and the check output; the flag surface is the same either way and
+`--json` reports which mode ran (`resume: "continue" | "fresh"`).
 
 ## The run
 
@@ -131,6 +143,23 @@ worktree is the boundary), `--max-concurrent` (one instance), `--until` and
    `git status --porcelain` for untracked files, added with `git add -N`). Then
    `--apply` if asked, then output.
 
+## Streaming tool calls (`--trace`)
+
+Freebuff appends to the session's `log.jsonl` while the run is in progress. The
+driver tails it from the offset at send time and, for each record that carries a
+tool call or tool result, prints one line to stderr as it appears:
+
+```
+freebuff-task: [12.3s] read_files README.md, SKILL.md
+freebuff-task: [14.9s] run_terminal_command "python3 -m pytest -q"
+freebuff-task: [21.0s] str_replace scripts/foo.py
+```
+
+The exact record shape is pinned in the verification pass (item 4) and mirrored
+by `tests/fake-freebuff`. Records that do not match are ignored, never fatal.
+The same tail feeds `tool_calls` in `--json` (count and names, cumulative across
+`--until` passes) so callers get what devin-task's `tool_calls` gave.
+
 ## Failure classification
 
 Checked in this order, transient first, against the screen buffer and log:
@@ -163,7 +192,8 @@ Checked in this order, transient first, against the screen buffer and log:
 - `tests/test_freebuff_task.sh`: drives the wrapper against the fake through
   `PATH`, covering each exit code, `--json` shape, worktree creation and pruning,
   `--apply` success and refusal, `--no-worktree`, bracketed-paste of a multi-line
-  prompt, and timeout.
+  prompt, timeout, `--trace` tool-call lines, and `--until` / `--progress` loops
+  in both resume modes.
 - `tests/test_freebuff_task_live.sh`: opt-in (`FREEBUFF_TASK_LIVE=1`), one real
   run that reads a file and reports its content.
 
@@ -172,9 +202,9 @@ Checked in this order, transient first, against the screen buffer and log:
 Against the real binary, recorded in the README:
 
 1. Which key sequence exits: Ctrl-C twice, Ctrl-D, or only SIGTERM.
-2. Whether `--continue <id>` takes the chat directory name (enables `--until` later).
+2. Whether `--continue <id>` takes the chat directory name and resumes with context (selects the `--until` resume mode).
 3. Whether a second concurrent instance is refused, and with what text.
-4. How the `/model` picker is driven from keys, and the exact finish record in `log.jsonl`.
+4. How the `/model` picker is driven from keys, the exact finish record in `log.jsonl`, and the shape of its tool-call and tool-result records.
 5. Whether a prompt containing newlines submits early without bracketed paste.
 
 ## Limitations
