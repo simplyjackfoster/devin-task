@@ -332,6 +332,23 @@ def wait_complete(chatdir, deadline, proc=None, tracer=None):
         time.sleep(0.5)
     return "timeout"
 
+def current_model():
+    p = os.path.join(config_root(), "settings.json")
+    try: return json.load(open(p)).get("freebuffModel", "")
+    except Exception: return ""
+
+def select_model(proc, model, deadline):
+    if not model or model in current_model():
+        return
+    proc.write(b"/model\r"); time.sleep(0.5)
+    proc.write(model.encode() + b"\r")
+    end = min(deadline, time.time() + 5)
+    while time.time() < end:
+        proc.read_nonblocking()
+        if not proc.alive:
+            return
+        time.sleep(0.2)
+
 def run_once(args, prompt, err):
     start = time.time()
     with instance_lock(args.slot_timeout, err):
@@ -348,6 +365,7 @@ def run_once(args, prompt, err):
             if code is not None:
                 err("freebuff hit a known failure screen"); return code
             err("freebuff never became ready"); return EXIT_ERR
+        select_model(proc, args.model, deadline)
         rc = drive(proc, args, prompt, chatdir, wt, deadline, err, start, root)
         return rc
 

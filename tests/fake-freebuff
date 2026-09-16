@@ -26,10 +26,22 @@ def main(argv):
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         time.sleep(3600)
     # wait for the driver's pasted prompt on stdin (a line)
+    selected_model = None
     try:
-        prompt = sys.stdin.readline()
+        line = sys.stdin.readline()
     except Exception:
-        prompt = ""
+        line = ""
+    if line.startswith("/model"):
+        try:
+            selected_model = sys.stdin.readline().strip()
+        except Exception:
+            selected_model = ""
+        meta.write_text(json.dumps({"messageCount": 0, "model": selected_model}))
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            line = ""
+    prompt = line
     if scen == "notsignedin":
         sys.stdout.write("Not signed in. Run `freebuff login`.\n"); sys.stdout.flush(); time.sleep(0.2); return
     if scen == "ratelimited":
@@ -61,7 +73,10 @@ def main(argv):
         {"variant": "user", "content": prompt.strip()},
         {"variant": "ai", "blocks": blocks, "isComplete": not interrupted,
          "metadata": {}, "timestamp": "now"}]))
-    meta.write_text(json.dumps({"messageCount": 2, "messagesMtimeMs": time.time() * 1000}))
+    meta_obj = {"messageCount": 2, "messagesMtimeMs": time.time() * 1000}
+    if selected_model is not None:
+        meta_obj["model"] = selected_model
+    meta.write_text(json.dumps(meta_obj))
     with log.open("a") as fh:
         fh.write(json.dumps({"msg": "[send-message] run finished", "runId": run_id, "status": "done"}) + "\n")
     # idle until the driver sends the exit key(s), then quit

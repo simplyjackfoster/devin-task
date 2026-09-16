@@ -89,4 +89,11 @@ python3 -c "import json; d=json.load(open('$WORK/o12')); assert d['tool_calls']>
 FAKE_FREEBUFF_SCENARIO=toolcalls run_to 30 "$FT" --cwd "$REPO" --trace "go" 2>"$WORK/e12b" >/dev/null || true
 grep -q "read_files" "$WORK/e12b" && ok "--trace prints tool calls" || bad "no trace line"
 
+# Task 13: model selection via /model when it differs from settings.json
+echo '{"freebuffModel":"z-ai/glm-5.2"}' > "$FREEBUFF_CONFIG_DIR/settings.json"
+FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="m" \
+  run_to 30 "$FT" --cwd "$REPO" --model glm-5.3-flash --answer-only "go" >/dev/null 2>&1 || true
+found13="$(find "$FREEBUFF_CONFIG_DIR/projects" -name chat-meta.json | sort | tail -1)"
+[ -n "$found13" ] && grep -q "glm-5.3-flash" "$found13" && ok "/model selection sent" || bad "model not selected: $(cat "$found13" 2>/dev/null)"
+
 exit $fail
