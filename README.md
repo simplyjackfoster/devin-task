@@ -393,7 +393,7 @@ freebuff-task --until 'CHECK' --progress './check.sh --count' "prompt"   # loop 
 | `--cwd DIR` | repo to work in, default current directory. Must be inside a git repo unless `--no-worktree` |
 | `--no-worktree` | run in the real working tree instead of an isolated one. Off by default |
 | `--apply` | on exit 0, apply the worktree's diff to the real working tree with `git apply`; if it does not apply cleanly, exit 1 (the diff still prints with `--diff`) |
-| `--diff` | print the worktree diff after the answer |
+| `--diff` | print the worktree diff after the answer; ignored when `--answer-only` is also given |
 | `--model M` | Freebuff model, default `glm-5.3-flash`; selected through the TUI's `/model` picker when it differs from `settings.json` |
 | `--timeout S` | whole-run wall clock, default 600; exit 124 |
 | `--slot-timeout S` | how long to wait for the machine-wide instance lock, default 600; exit 6 on expiry |
@@ -403,10 +403,10 @@ freebuff-task --until 'CHECK' --progress './check.sh --count' "prompt"   # loop 
 | `--max-passes N` | cap for `--until`, default 5; exit 5 when exhausted. Ignored when `--progress` is given |
 | `--progress CMD` | after each `--until` pass run `bash -c CMD`; it must print one integer. A pass that does not raise it is a stall; while it rises the run is unbounded |
 | `--max-stalls N` | consecutive stalls that end a `--progress` run, default 5; exit 5 |
-| `--answer-only` | print only the final message |
-| `--json` | print `{answer, session_id, worktree, branch, diff_stat, exit_code, tool_calls, elapsed}` |
-| `--trace` | heartbeat plus every tool call as Freebuff logs it, on stderr |
-| `--summary` | one line on stderr at exit; also `FREEBUFF_TASK_SUMMARY=1` |
+| `--answer-only` | print only the final message; wins over `--diff` if both are given |
+| `--json` | print `{answer, session_id, worktree, branch, diff_stat, exit_code, tool_calls, elapsed}`; on a not-ready failure (freebuff never became usable) this is a minimal object with just `exit_code` set and the rest empty/zeroed, so a machine caller still gets a reason |
+| `--trace` | print each tool call as Freebuff logs it, on stderr, as it happens (no periodic heartbeat) |
+| `--summary` | one line on stderr at exit: elapsed seconds, tool-call count, exit code; also `FREEBUFF_TASK_SUMMARY=1` |
 
 Deliberately absent, unlike devin-task: `--edit`/`--yolo` (the worktree is the
 permission boundary, so every run may write), `--allow` (no permission model
@@ -457,10 +457,23 @@ bash tests/test_freebuff_task.sh
 ```
 
 Drives the wrapper against `tests/fake-freebuff`, a stub that plays back the
-same transcript shapes the real binary writes, covering each exit code,
-`--json`'s shape, worktree creation and pruning, `--apply` success and
-refusal, `--no-worktree`, bracketed-paste of a multi-line prompt, timeout,
-`--trace`'s tool-call lines, and `--until`/`--progress` loops.
+same transcript shapes the real binary writes. Covers: exit codes 0, 1
+(freebuff never became usable, incl. the `--json` shape on that path), 2, 3,
+5 (`--max-passes` and `--progress`/`--max-stalls`), 6, 8, 9 (an empty turn,
+distinct from a genuine 124 timeout), 124, and 143 (SIGINT, with a check that
+the freebuff child is actually gone afterward); the standing preamble being
+sent atomically with the prompt; bracketed-paste of a multi-line prompt
+landing as one message with both lines intact; `--json`'s shape and
+`tool_calls` count; `--trace`'s tool-call lines; `--answer-only` taking
+precedence over `--diff`; `--apply` success, refusal on a conflicting diff,
+and the real tree being untouched either way; `--no-worktree`; worktree
+pruning under `--keep-worktrees`; `/model` selection (both "differs" and "no
+settings.json yet, skip it"); and `--summary`/`FREEBUFF_TASK_SUMMARY`.
+
+Not yet covered: the `neverready`/`notsignedin`-adjacent slow paths that only
+resolve after a fixed internal wait, and the `CONTINUE_SUPPORTED = False`
+fresh-session fallback (both intentionally deferred alongside Task 1's live
+verification, see below).
 
 ```bash
 FREEBUFF_TASK_LIVE=1 bash tests/test_freebuff_task_live.sh
