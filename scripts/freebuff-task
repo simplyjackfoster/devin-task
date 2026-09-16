@@ -7,6 +7,8 @@ See docs/superpowers/specs/2026-09-16-freebuff-task-design.md.
 """
 import argparse, json, os, sys
 import subprocess, tempfile, time, shutil, glob
+import fcntl
+from contextlib import contextmanager
 
 PROG = "freebuff-task"
 EXIT_OK, EXIT_ERR, EXIT_USAGE, EXIT_ASK = 0, 1, 2, 3
@@ -106,16 +108,36 @@ def run_dir(args, err):
     wt = make_worktree(root, args.keep_worktrees)
     return wt, wt
 
+@contextmanager
+def instance_lock(slot_timeout, err):
+    path = os.path.join(tempfile.gettempdir(), "freebuff-task.lock")
+    fh = open(path, "w")
+    deadline = time.time() + slot_timeout
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                err("timed out waiting for the Freebuff instance slot")
+                sys.exit(EXIT_RETRY)
+            time.sleep(0.5)
+    try:
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
+
 def run_once(args, prompt, err):  # replaced/extended by later tasks
-    cwd, wt = run_dir(args, err)
-    # minimal spawn for this task; replaced by pty driver in Task 6
-    env = dict(os.environ)
-    subprocess.run(["freebuff", "--cwd", cwd], input=prompt + "\n",
-                   text=True, capture_output=True, env=env)
-    if args.diff and wt:
-        diff, stat = worktree_diff(wt)
-        sys.stdout.write(diff)
-    return EXIT_OK
+    with instance_lock(args.slot_timeout, err):
+        cwd, wt = run_dir(args, err)
+        # minimal spawn for this task; replaced by pty driver in Task 6
+        env = dict(os.environ)
+        subprocess.run(["freebuff", "--cwd", cwd], input=prompt + "\n",
+                       text=True, capture_output=True, env=env)
+        if args.diff and wt:
+            diff, stat = worktree_diff(wt)
+            sys.stdout.write(diff)
+        return EXIT_OK
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

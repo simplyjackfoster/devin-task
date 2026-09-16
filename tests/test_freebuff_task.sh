@@ -27,4 +27,15 @@ grep -q "new.txt" "$WORK/o2" && ok "diff shows worktree change" || bad "diff mis
 # real checkout untouched
 [ ! -e "$REPO/new.txt" ] && ok "real checkout untouched" || bad "real checkout was written"
 
+# a held lock makes a second run give up with exit 6 under a short slot timeout
+python3 - "$WORK" <<'PY' &
+import fcntl, os, sys, time, tempfile
+lk = os.path.join(tempfile.gettempdir(), "freebuff-task.lock")
+f = open(lk, "w"); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(3)
+PY
+sleep 0.5
+set +e; FAKE_FREEBUFF_SCENARIO=answer "$FT" --cwd "$REPO" --slot-timeout 1 "hi" >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" -eq 6 ] && ok "lock contention exits 6" || bad "lock rc=$rc"
+wait
+
 exit $fail
