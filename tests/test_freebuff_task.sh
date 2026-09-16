@@ -76,4 +76,9 @@ FAKE_FREEBUFF_SCENARIO=answer FAKE_FREEBUFF_ANSWER="applied" FAKE_FREEBUFF_WRITE
   run_to 30 "$FT" --cwd "$REPO" --apply --answer-only "go" >/dev/null 2>&1 || true
 [ -f "$REPO/applied.txt" ] && grep -q yes "$REPO/applied.txt" && ok "--apply writes to real tree" || bad "--apply did not apply"
 
+set +e; FAKE_FREEBUFF_SCENARIO=notsignedin run_to 15 "$FT" --cwd "$REPO" "hi" >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" -eq 8 ] && ok "not-signed-in -> exit 8" || bad "notsignedin rc=$rc"
+set +e; FAKE_FREEBUFF_SCENARIO=ratelimited run_to 15 "$FT" --cwd "$REPO" "hi" >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" -eq 6 ] && ok "rate-limited -> exit 6" || bad "ratelimited rc=$rc"
+
 exit $fail

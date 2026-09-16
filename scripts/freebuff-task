@@ -232,10 +232,23 @@ def send_prompt(proc, chatdir, text, deadline, err):
         proc.read_nonblocking()
         if _send_landed(chatdir):
             return
+        if not proc.alive:
+            # process exited before confirming; let wait_complete/classify handle it
+            return
         if not resent and time.time() - (sent_deadline - 30) > 15:
             proc.write(payload); resent = True
         time.sleep(0.3)
     err("prompt never registered with freebuff"); sys.exit(EXIT_EMPTY)
+
+def classify(screen):
+    s = screen.lower()
+    if any(k in s for k in ("rate limited", "queues when busy", "cannot safely start or resume")):
+        return EXIT_RETRY
+    if any(k in s for k in ("buy more credits", "continue in a new session")):
+        return EXIT_RETRY
+    if "not signed in" in s:
+        return EXIT_AUTH
+    return None
 
 INTERRUPTED = "[response interrupted]"
 
@@ -277,13 +290,17 @@ def is_complete(chatdir):
         return False
     return _run_finished(chatdir)
 
-def wait_complete(chatdir, deadline):
+def wait_complete(chatdir, deadline, proc=None):
     while time.time() < deadline:
+        if proc is not None:
+            proc.read_nonblocking()
         msg = last_ai(chatdir)
         if msg and pending_question(msg) and msg.get("isComplete"):
             return "ask"
         if is_complete(chatdir):
             return "done"
+        if proc is not None and not proc.alive:
+            return "timeout"
         time.sleep(0.5)
     return "timeout"
 
@@ -297,13 +314,23 @@ def run_once(args, prompt, err):
         deadline = time.time() + args.timeout
         chatdir = wait_ready(proc, cwd, before, 0.75, deadline)
         if not chatdir:
-            proc.send_signal(signal.SIGTERM); proc.close()
+            proc.send_signal(signal.SIGTERM)
+            code = classify(proc.screen.decode(errors="replace"))
+            proc.close()
+            if code is not None:
+                err("freebuff hit a known failure screen"); return code
             err("freebuff never became ready"); return EXIT_ERR
         rc = drive(proc, args, prompt, chatdir, wt, deadline, err, start, root)
         return rc
 
 def finish_pty(proc):
-    proc.write(b"\x03"); time.sleep(0.5); proc.write(b"\x03"); time.sleep(3)
+    try:
+        if proc.alive:
+            proc.write(b"\x03"); time.sleep(0.5)
+            if proc.alive:
+                proc.write(b"\x03"); time.sleep(3)
+    except OSError:
+        pass
     if proc.alive: proc.send_signal(signal.SIGTERM); time.sleep(3)
     if proc.alive: proc.send_signal(signal.SIGKILL)
     proc.close()
@@ -325,14 +352,15 @@ def emit(args, result, wt, diff, stat):
 
 def drive(proc, args, prompt, chatdir, wt, deadline, err, start, root):
     send_prompt(proc, chatdir, prompt, deadline, err)
-    state = wait_complete(chatdir, deadline)
+    state = wait_complete(chatdir, deadline, proc)
     if state == "ask":
         msg = last_ai(chatdir)
         answer = pending_question(msg) or ""
         rc = EXIT_ASK
     elif state == "timeout":
         answer = ""
-        rc = EXIT_TIMEOUT
+        code = classify(proc.screen.decode(errors="replace"))
+        rc = code if code is not None else EXIT_TIMEOUT
     else:
         msg = last_ai(chatdir)
         answer = extract_answer(msg) if msg else ""
